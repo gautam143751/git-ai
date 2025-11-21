@@ -763,6 +763,7 @@ impl AttributionTracker {
         let mut new_pos = 0;
         let mut deletion_idx = 0;
         let mut insertion_idx = 0;
+        let mut prev_whitespace_delete = false;
 
         for diff in diffs {
             let op = diff.op();
@@ -793,6 +794,7 @@ impl AttributionTracker {
 
                     old_pos += len;
                     new_pos += len;
+                    prev_whitespace_delete = false;
                 }
                 Ops::Delete => {
                     let deletion_range = (old_pos, old_pos + len);
@@ -832,6 +834,7 @@ impl AttributionTracker {
 
                     old_pos += len;
                     deletion_idx += 1;
+                    prev_whitespace_delete = data_is_whitespace(diff.data());
                 }
                 Ops::Insert => {
                     // Check if this insertion is from a detected move
@@ -884,6 +887,7 @@ impl AttributionTracker {
 
                         new_pos += len;
                         insertion_idx += 1;
+                        prev_whitespace_delete = false;
                         continue;
                     }
 
@@ -891,8 +895,21 @@ impl AttributionTracker {
                     let insertion_range = (new_pos, new_pos + len);
                     let is_substantive_insert =
                         ranges_intersect(substantive_new_ranges, insertion_range);
-                    let (author_id, attribution_ts) = if is_substantive_insert {
+                    let is_whitespace_only = data_is_whitespace(diff.data());
+                    let contains_newline = diff.data().iter().any(|b| *b == b'\n');
+                    let is_formatting_pair = prev_whitespace_delete && is_whitespace_only;
+                    let (author_id, attribution_ts) = if contains_newline {
                         (current_author.to_string(), ts)
+                    } else if is_substantive_insert {
+                        (current_author.to_string(), ts)
+                    } else if is_formatting_pair {
+                        if let Some(attr) = find_attribution_for_insertion(old_attributions, old_pos) {
+                            (attr.author_id.clone(), attr.ts)
+                        } else if let Some(attr) = new_attributions.last() {
+                            (attr.author_id.clone(), attr.ts)
+                        } else {
+                            (current_author.to_string(), ts)
+                        }
                     } else if let Some(attr) = new_attributions.last() {
                         (attr.author_id.clone(), attr.ts)
                     } else if let Some(attr) = find_attribution_for_insertion(old_attributions, old_pos) {
@@ -910,6 +927,7 @@ impl AttributionTracker {
 
                     new_pos += len;
                     insertion_idx += 1;
+                    prev_whitespace_delete = false;
                 }
             }
         }
@@ -1316,6 +1334,16 @@ fn find_attribution_for_insertion<'a>(
         .min_by_key(|a| a.start);
 
     before.or(after)
+}
+
+fn data_is_whitespace(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+
+    std::str::from_utf8(data)
+        .map(|s| s.chars().all(|c| c.is_whitespace()))
+        .unwrap_or(false)
 }
 
 impl Default for AttributionTracker {
@@ -1762,5 +1790,44 @@ mod tests {
         assert_eq!(filled.len(), 2);
         assert_range_owned_by(&filled, 0, 1, "Alice");
         assert_range_owned_by(&filled, 1, content.len(), "Bob");
+    }
+
+    #[test]
+    fn ai_inserted_blank_line_counts_for_ai() {
+        let tracker = AttributionTracker::new();
+        let old = "# My Application\n";
+        let new = "# My Application\n\nimport os\nimport sys\n\ndef setup():\n    print(\"Setting up\")\n\ndef main():\n    setup()\n    print(\"Running main\")\n\ndef cleanup():\n    print(\"Cleaning up\")\n\nif __name__ == \"__main__\":\n    main()\n";
+
+        let human_attrs = vec![Attribution::new(0, old.len(), "human".into(), TEST_TS)];
+        let diff_ops: Vec<_> = tracker
+            .compute_diffs(old, new)
+            .unwrap()
+            .diffs
+            .iter()
+            .map(|d| d.op())
+            .collect();
+        assert!(
+            matches!(diff_ops.first(), Some(Ops::Equal)),
+            "expected first diff op to be equal, got {:?}",
+            diff_ops
+        );
+        let updated = tracker
+            .update_attributions(old, new, &human_attrs, "ai", TEST_TS + 1)
+            .unwrap();
+
+        assert!(
+            updated
+                .iter()
+                .any(|a| a.author_id == "human" && a.start == 0 && a.end >= old.len()),
+            "header should remain attributed to human"
+        );
+
+        let line_attrs = attributions_to_line_attributions(&updated, new);
+        let ai_block = line_attrs
+            .iter()
+            .find(|la| la.author_id == "ai")
+            .expect("AI block missing");
+        assert_eq!(ai_block.start_line, 2);
+        assert_eq!(ai_block.end_line, 17);
     }
 }
