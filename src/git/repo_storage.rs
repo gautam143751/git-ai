@@ -1,5 +1,6 @@
 use crate::authorship::attribution_tracker::LineAttribution;
 use crate::authorship::authorship_log::PromptRecord;
+use crate::authorship::authorship_log_serialization::generate_short_hash;
 use crate::authorship::working_log::{CHECKPOINT_API_VERSION, Checkpoint, CheckpointKind};
 use crate::error::GitAiError;
 use crate::git::rewrite_log::{RewriteLogEvent, append_event_to_file};
@@ -87,20 +88,27 @@ impl RepoStorage {
     pub fn delete_working_log_for_base_commit(&self, sha: &str) -> Result<(), GitAiError> {
         let working_log_dir = self.working_logs.join(sha);
         if working_log_dir.exists() {
-            fs::remove_dir_all(&working_log_dir)?;
+            if cfg!(debug_assertions) {
+                // In debug mode, move to old-{sha} instead of deleting
+                let old_dir = self.working_logs.join(format!("old-{}", sha));
+                // If old-{sha} already exists, remove it first
+                if old_dir.exists() {
+                    fs::remove_dir_all(&old_dir)?;
+                }
+                fs::rename(&working_log_dir, &old_dir)?;
+                debug_log(&format!(
+                    "Debug mode: moved checkpoint directory from {} to {}",
+                    sha,
+                    format!("old-{}", sha)
+                ));
+            } else {
+                // In non-debug mode, delete as before
+                fs::remove_dir_all(&working_log_dir)?;
+            }
         }
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub fn delete_all_working_logs(&self) -> Result<(), GitAiError> {
-        if self.working_logs.exists() {
-            fs::remove_dir_all(&self.working_logs)?;
-            // Recreate the empty directory structure
-            fs::create_dir_all(&self.working_logs)?;
-        }
-        Ok(())
-    }
 
     /* Rewrite Log Persistance */
 
@@ -338,7 +346,52 @@ impl PersistedWorkingLog {
             checkpoints.push(checkpoint);
         }
 
-        Ok(checkpoints)
+        // Migrate 7-char prompt hashes to 16-char hashes
+        // Step 1: Build mapping from old 7-char hash to new 16-char hash
+        let mut old_to_new_hash: HashMap<String, String> = HashMap::new();
+        
+        for checkpoint in &checkpoints {
+            if let Some(agent_id) = &checkpoint.agent_id {
+                let new_hash = generate_short_hash(&agent_id.id, &agent_id.tool);
+                let old_hash = new_hash[..7].to_string();
+                old_to_new_hash.insert(old_hash, new_hash);
+            }
+        }
+
+        // Step 2: Replace 7-char author_ids in all checkpoints' attributions and line_attributions
+        let mut migrated_checkpoints = Vec::new();
+        for mut checkpoint in checkpoints {
+            for entry in &mut checkpoint.entries {
+                // Replace author_ids in attributions
+                for attr in &mut entry.attributions {
+                    if attr.author_id.len() == 7 {
+                        if let Some(new_hash) = old_to_new_hash.get(&attr.author_id) {
+                            attr.author_id = new_hash.clone();
+                        }
+                    }
+                }
+
+                // Replace author_ids in line_attributions
+                for line_attr in &mut entry.line_attributions {
+                    if line_attr.author_id.len() == 7 {
+                        if let Some(new_hash) = old_to_new_hash.get(&line_attr.author_id) {
+                            line_attr.author_id = new_hash.clone();
+                        }
+                    }
+                    // Also migrate the overrode field if it contains a 7-char hash
+                    if let Some(ref overrode_id) = line_attr.overrode {
+                        if overrode_id.len() == 7 {
+                            if let Some(new_hash) = old_to_new_hash.get(overrode_id) {
+                                line_attr.overrode = Some(new_hash.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            migrated_checkpoints.push(checkpoint);
+        }
+
+        Ok(migrated_checkpoints)
     }
 
     /// Write all checkpoints to the JSONL file, replacing any existing content
