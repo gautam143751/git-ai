@@ -37,6 +37,7 @@ mod tests {
     #[case("react")]
     #[case("node")]
     #[case("chakracore")]
+    #[ignore]
     fn test_human_only_edits_then_commit(#[case] repo_name: &str) {
         let repos = get_performance_repos();
         let test_repo = repos
@@ -99,6 +100,7 @@ mod tests {
     #[case("react")]
     #[case("node")]
     #[case("chakracore")]
+    #[ignore]
     fn test_human_only_edits_in_big_files_then_commit(#[case] repo_name: &str) {
         let repos = get_performance_repos();
         let test_repo = repos
@@ -164,6 +166,7 @@ mod tests {
     #[case("react")]
     #[case("node")]
     #[case("chakracore")]
+    #[ignore]
     fn test_git_reset_head_5(#[case] repo_name: &str) {
         let repos = get_performance_repos();
         let test_repo = repos

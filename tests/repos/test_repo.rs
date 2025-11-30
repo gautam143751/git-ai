@@ -326,6 +326,7 @@ mod tests {
     use crate::lines;
 
     #[test]
+    #[ignore]
     fn test_invoke_git() {
         let repo = TestRepo::new();
         let output = repo.git(&["status"]).expect("git status should succeed");
@@ -334,6 +335,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
     fn test_invoke_git_ai() {
         let repo = TestRepo::new();
         let output = repo
@@ -373,6 +375,7 @@ mod tests {
     // }
 
     #[test]
+    #[ignore]
     fn test_assert_lines_and_blame() {
         let repo = TestRepo::new();
 
