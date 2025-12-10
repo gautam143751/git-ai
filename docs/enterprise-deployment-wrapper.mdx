@@ -1,28 +1,42 @@
 ---
-title: Enterprise Deployment - Git Wrapper
-description: Deploy Git AI as a Git wrapper across your organization using MDM or custom install scripts. Recommended enterprise deployment method for tracking AI code at scale.
-keywords: git ai wrapper, git proxy, enterprise deployment, mdm installation, git ai rollout, install script
+title: Distributing Git AI Extension
+description: Deploy Git AI extension across your organization using MDM or custom install scripts. Recommended enterprise deployment method for tracking AI code at scale.
+keywords: git ai extension, git proxy, enterprise deployment, mdm installation, git ai rollout, install script
 ---
 
-The recommended way to distribute Git AI to developer machines is as a Git wrapper. This approach intercepts git commands and allows Git AI to track AI-assisted changes without modifying git's core behavior. You can either deploy the wrapper in a dedicated directory (as our install scripts do) or drop it directly in front of the existing `git` entry by overwriting its symlink. Pick the option that best matches how your fleet manages PATH.
+Git AI is a git extension that maintains accurate AI authorship tracking with Git Notes. 
 
-## Overview
+- **Simple Setup**: Single binary deployment, no per-repository configuration
+- **Automatic Hook Triggering**: Works without modifying repository hooks
+- **User Transparency**: Developers use `git` commands as normal
+- **Easy Updates**: Replace the binary to update all users
+- **No Repository Modification**: Doesn't change `.git/hooks` in repositories
 
-When Git AI is installed as a wrapper:
-1. Calls to `git` are handled by the `git-ai` binary
-2. Git AI processes the command and collects necessary metadata
-3. The command is passed through to the original git binary
-4. Hooks are automatically triggered at the appropriate times
 
-This is the same method used by the [`install.sh`](https://github.com/acunniffe/git-ai/blob/main/install.sh) and [`install.ps1`](https://github.com/acunniffe/git-ai/blob/main/install.ps1) scripts for personal installations.
+When Git AI is installed:
 
+1. Calls to `git` are intercepted by the `git-ai` binary and routed to `git`. The `stdio` and the exit code are piped back to the caller making making the interception transparent to the caller.
+1. Git AI will update AI Authorship depending on the command being executed. For example:
+ - When `git commit` is executed successfully, Git AI will attach an AI Authorship Git Note to the commit.
+ - When `git stash` is run, Git AI will also stash working AI Authorship log so it can be restored when the stash is applied.
+ - When `git rebase` is run, Git AI will update the AI Authorship of the resulting to accuratly reflect the AI Authorship of the code in the rebased history.
+
+
+ 
 ## Installation Requirements
 
-Choose a wrapper layout that matches how your environment manages the `git` binary.
+- OSX: 14.0+
+- Ubuntu 18+ (and likely other Linux distributions from same era)
+- Windows: 10+
+- Git 2.23+ (must already be installed on the machine)
 
-### Option A: User-Scoped Wrapper Directory
+## Installation Steps
 
-Use this when you can add a new directory to each user's PATH (mirrors the official install scripts).
+Example Linux/Unix installation script: https://github.com/acunniffe/git-ai/blob/main/install.sh
+Example Windows installation script: https://github.com/acunniffe/git-ai/blob/main/install.ps1
+
+
+### Option A: User-Scoped Directory
 
 **Unix/Linux/macOS**
 - Install the `git-ai` binary to `$HOME/.git-ai/bin/git-ai`
@@ -52,8 +66,8 @@ Use this when your fleet already exposes `git` from a shared directory that is l
 2. Preserve the original git binary:
    - If `git_path` is a symlink: `sudo ln -sf "$(readlink "$git_path")" "$git_dir/git-og"`
    - If it's a regular file: `sudo mv "$git_path" "$git_dir/git-og"`
-3. Install the wrapper alongside it: `sudo install -m 0755 /path/to/git-ai "$git_dir/git-ai"`
-4. Point `git` at the wrapper: `sudo ln -sf "$git_dir/git-ai" "$git_path"`
+3. Install the extension alongside it: `sudo install -m 0755 /path/to/git-ai "$git_dir/git-ai"`
+4. Point `git` at the extension: `sudo ln -sf "$git_dir/git-ai" "$git_path"`
 5. Confirm that `"$git_dir/git-og"` remains executable—Git AI will delegate to it.
 
 **Windows**
@@ -73,11 +87,11 @@ Use this when your fleet already exposes `git` from a shared directory that is l
        Rename-Item -Path $gitPath -NewName 'git-og.exe'
    }
    ```
-3. Copy the wrapper into the same directory:
+3. Copy the extension into the same directory:
    ```powershell
    Copy-Item -Path 'C:\path\to\git-ai.exe' -Destination (Join-Path $gitDir 'git-ai.exe')
    ```
-4. Replace `git.exe` with a link to the wrapper (requires Developer Mode or elevated privileges to create file symlinks). If symlinks are disabled, copy `git-ai.exe` to `git.exe` instead.
+4. Replace `git.exe` with a link to the extension (requires Developer Mode or elevated privileges to create file symlinks). If symlinks are disabled, copy `git-ai.exe` to `git.exe` instead.
    ```powershell
    New-Item -ItemType SymbolicLink -Path (Join-Path $gitDir 'git.exe') -Target (Join-Path $gitDir 'git-ai.exe')
    ```
@@ -98,7 +112,7 @@ This method keeps the rest of PATH untouched and ensures existing automation con
 
 **Windows:**
 - Add `%USERPROFILE%\.git-ai\bin` to the System PATH
-- The directory should be positioned **before** any existing Git installation directories to ensure the git-ai wrapper takes precedence
+- The directory should be positioned **before** any existing Git installation directories to ensure the git-ai extension takes precedence
 
 ### Configuration File
 
@@ -153,7 +167,7 @@ These scripts handle edge cases like:
 After installation, verify the setup:
 
 ```bash
-# Should show git-ai wrapper
+# Should show git-ai extension
 which git
 
 # Should show git-ai version
@@ -162,15 +176,3 @@ git --version
 # Should show original git
 git-og --version
 ```
-
-## Advantages of the Wrapper Method
-
-- **Simple Setup**: Single binary deployment, no per-repository configuration
-- **Automatic Hook Triggering**: Works without modifying repository hooks
-- **User Transparency**: Developers use `git` commands as normal
-- **Easy Updates**: Replace the binary to update all users
-- **No Repository Modification**: Doesn't change `.git/hooks` in repositories
-
-## Alternative Deployment
-
-If you prefer not to wrap git, see [Enterprise Deployment: Git Hooks](/enterprise-deployment-hooks) for the core.hooksPath approach.

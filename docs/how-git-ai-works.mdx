@@ -115,9 +115,9 @@ For line 2 of `file.ts` inserted by commit `6e4d6f2`, Git AI looks up the Author
 
 Early versions of Git AI required developers to manually add git hooks and refspecs for syncing notes to every repository. This was cumbersome, especially in repos with existing hooks. Teams requested a one-liner setup that worked across all repos and agents.
 
-The solution: making Git AI a git wrapper. This allows Git AI to act as if it has pre- and post-command hooks on every git command without explicit hook configuration in each repository.
+The solution: making Git AI a git extension. This allows Git AI to act as if it has pre- and post-command hooks on every git command without explicit hook configuration in each repository.
 
-We've profiled the wrapper and found the overhead to be about 10-20ms per command -- most of it in spawning the git process. See the [wrapper implementation](https://github.com/acunniffe/git-ai?tab=readme-ov-file#install):
+We've profiled the extension and found the overhead to be about 10-20ms per command -- most of it in spawning the git process. See the [extension implementation](https://github.com/acunniffe/git-ai?tab=readme-ov-file#install):
 
 ```rust
 let repository = repository_option.as_mut().unwrap();

@@ -16,12 +16,6 @@ GIT_AI_DEBUG_PERFORMANCE=1 git-ai <command>
 
 This will show you the exact overhead Git AI adds to each operation.
 
-## Proxy Mode Overhead
-
-When running in proxy mode, Git AI adds approximately **10-20ms of overhead** per git command. This overhead primarily comes from starting the git process and piping arguments to the underlying binary. 
-
-For git commands that Git AI hooks into (commit, rebase, cherry-pick, reset, merge, fetch, and push), Git AI adds anywhere from **20-250ms** on large commits in big repos. 
-
 ## Scalability
 
 ### How does Git AI scale with repository size?
@@ -80,20 +74,8 @@ As shown in the benchmarks above, sync time remains under 15ms even with 100,000
 - No practical limit on the number of notes
 - Won't hit git's ref limits even in very large repositories
 
-## Performance Best Practices
 
-### For Individual Developers
-
-1. **Use the wrapper method** - The git wrapper approach has better performance than hook-based methods
-3. **Keep agents updated** - Newer versions of coding agents with the latest Git AI hooks will be most optimized. Run `git-ai install-hooks` to update your hooks.
-
-### For Enterprise Deployments
-
-1. **Monitor initial rollout** - Measure performance during pilot deployments
-2. **Configure strategically** - Use repository allowlists to control where Git AI runs (see [Enterprise Configuration](https://usegitai.com/docs/enterprise-configuration))
-3. **Sync notes efficiently** - Notes sync automatically after push/fetch with minimal overhead
-
-## Common Performance Questions
+## FAQs
 
 ### Does Git AI slow down git operations noticeably?
 
