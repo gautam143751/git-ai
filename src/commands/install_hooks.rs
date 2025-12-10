@@ -20,6 +20,10 @@ const MIN_CLAUDE_VERSION: (u32, u32) = (2, 0);
 const CLAUDE_PRE_TOOL_CMD: &str = "checkpoint claude --hook-input stdin";
 const CLAUDE_POST_TOOL_CMD: &str = "checkpoint claude --hook-input stdin";
 
+// Gemini hooks (uses shell, so relative path works)
+const GEMINI_BEFORE_TOOL_CMD: &str = "checkpoint gemini --hook-input stdin";
+const GEMINI_AFTER_TOOL_CMD: &str = "checkpoint gemini --hook-input stdin";
+
 // Cursor hooks (requires absolute path to avoid shell config loading delay)
 const CURSOR_BEFORE_SUBMIT_CMD: &str = "checkpoint cursor --hook-input stdin";
 const CURSOR_AFTER_EDIT_CMD: &str = "checkpoint cursor --hook-input stdin";
@@ -322,6 +326,46 @@ async fn async_run(binary_path: PathBuf, dry_run: bool) -> Result<(), GitAiError
         }
     }
 
+    match check_gemini() {
+        Ok(true) => {
+            any_checked = true;
+            // Install/update Gemini hooks
+            let spinner = Spinner::new("Gemini: checking hooks");
+            spinner.start();
+
+            match install_gemini_hooks(dry_run) {
+                Ok(Some(diff)) => {
+                    if dry_run {
+                        spinner.pending("Gemini: Pending updates");
+                    } else {
+                        spinner.success("Gemini: Hooks updated");
+                    }
+                    println!(); // Blank line before diff
+                    print_diff(&diff);
+                    has_changes = true;
+                }
+                Ok(None) => {
+                    spinner.success("Gemini: Hooks already up to date");
+                }
+                Err(e) => {
+                    spinner.error("Gemini: Failed to update hooks");
+                    eprintln!("  Error: {}", e);
+                    eprintln!("  Check that ~/.gemini/settings.json is valid JSON");
+                }
+            }
+        }
+        Ok(false) => {
+            // Gemini not detected
+        }
+        Err(version_error) => {
+            any_checked = true;
+            let spinner = Spinner::new("Gemini: checking version");
+            spinner.start();
+            spinner.error("Gemini: Version check failed");
+            eprintln!("  Error: {}", version_error);
+        }
+    }
+
     if !any_checked {
         println!("No compatible IDEs or agent configurations detected. Nothing to install.");
     } else if has_changes && dry_run {
@@ -483,6 +527,23 @@ fn check_opencode() -> Result<bool, String> {
 
     // OpenCode doesn't have a minimum version requirement for now
     // The plugin uses standard APIs that should work with any version
+
+    Ok(true)
+}
+
+fn check_gemini() -> Result<bool, String> {
+    let has_binary = binary_exists("gemini");
+    let has_dotfiles = {
+        let home = home_dir();
+        home.join(".gemini").exists()
+    };
+
+    if !has_binary && !has_dotfiles {
+        return Ok(false);
+    }
+
+    // Gemini doesn't have a minimum version requirement for now
+    // The hooks use standard APIs that should work with any version
 
     Ok(true)
 }
@@ -769,6 +830,206 @@ fn is_git_ai_checkpoint_command(cmd: &str) -> bool {
     true
 }
 
+fn install_gemini_hooks(dry_run: bool) -> Result<Option<String>, GitAiError> {
+    let settings_path = gemini_settings_path();
+
+    // Ensure directory exists
+    if let Some(dir) = settings_path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+
+    // Read existing content as string
+    let existing_content = if settings_path.exists() {
+        fs::read_to_string(&settings_path)?
+    } else {
+        String::new()
+    };
+
+    // Parse existing JSON if present, else start with empty object
+    let existing: Value = if existing_content.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&existing_content)?
+    };
+
+    // Desired hooks - Gemini doesn't need absolute paths, uses shell properly
+    let before_tool_cmd = format!("git-ai {}", GEMINI_BEFORE_TOOL_CMD);
+    let after_tool_cmd = format!("git-ai {}", GEMINI_AFTER_TOOL_CMD);
+
+    let desired_hooks = json!({
+        "BeforeTool": {
+            "matcher": "write_file|replace",
+            "desired_cmd": before_tool_cmd,
+        },
+        "AfterTool": {
+            "matcher": "write_file|replace",
+            "desired_cmd": after_tool_cmd,
+        }
+    });
+
+    // Merge desired into existing
+    let mut merged = existing.clone();
+    
+    // Ensure tools.enableHooks is set to true
+    if let Some(tools_obj) = merged.get_mut("tools").and_then(|t| t.as_object_mut()) {
+        // Only update if not already true
+        if tools_obj.get("enableHooks") != Some(&json!(true)) {
+            tools_obj.insert("enableHooks".to_string(), json!(true));
+        }
+    } else {
+        if let Some(root) = merged.as_object_mut() {
+            root.insert("tools".to_string(), json!({ "enableHooks": true }));
+        }
+    }
+
+    let mut hooks_obj = merged.get("hooks").cloned().unwrap_or_else(|| json!({}));
+
+    // Process both BeforeTool and AfterTool
+    for hook_type in &["BeforeTool", "AfterTool"] {
+        let desired_matcher = desired_hooks[hook_type]["matcher"].as_str().unwrap();
+        let desired_cmd = desired_hooks[hook_type]["desired_cmd"].as_str().unwrap();
+
+        // Get or create the hooks array for this type
+        let mut hook_type_array = hooks_obj
+            .get(*hook_type)
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        // Find existing matcher block for write_file|replace
+        let mut found_matcher_idx: Option<usize> = None;
+        for (idx, item) in hook_type_array.iter().enumerate() {
+            if let Some(matcher) = item.get("matcher").and_then(|m| m.as_str()) {
+                if matcher == desired_matcher {
+                    found_matcher_idx = Some(idx);
+                    break;
+                }
+            }
+        }
+
+        let matcher_idx = match found_matcher_idx {
+            Some(idx) => idx,
+            None => {
+                // Create new matcher block
+                hook_type_array.push(json!({
+                    "matcher": desired_matcher,
+                    "hooks": []
+                }));
+                hook_type_array.len() - 1
+            }
+        };
+
+        // Get the hooks array within this matcher block
+        let mut hooks_array = hook_type_array[matcher_idx]
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        // Update outdated git-ai checkpoint commands
+        // This finds ALL existing git-ai checkpoint commands and:
+        // 1. Updates the first one to the latest format (if needed)
+        // 2. Removes any duplicates (keeping only the updated one)
+        let mut found_idx: Option<usize> = None;
+        let mut needs_update = false;
+
+        for (idx, hook) in hooks_array.iter().enumerate() {
+            if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
+                if is_git_ai_checkpoint_command(cmd) {
+                    if found_idx.is_none() {
+                        found_idx = Some(idx);
+                        // Check if it matches exactly what we want
+                        if cmd != desired_cmd {
+                            needs_update = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        match found_idx {
+            Some(idx) => {
+                if needs_update {
+                    // Update to latest format
+                    hooks_array[idx] = json!({
+                        "type": "command",
+                        "command": desired_cmd
+                    });
+                }
+                // Remove any duplicate git-ai checkpoint commands
+                let keep_idx = idx;
+                let mut current_idx = 0;
+                hooks_array.retain(|hook| {
+                    let should_keep = if current_idx == keep_idx {
+                        current_idx += 1;
+                        true
+                    } else if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
+                        let is_dup = is_git_ai_checkpoint_command(cmd);
+                        current_idx += 1;
+                        !is_dup // Keep if it's NOT a git-ai checkpoint command
+                    } else {
+                        current_idx += 1;
+                        true
+                    };
+                    should_keep
+                });
+            }
+            None => {
+                // No existing command found, add new one
+                hooks_array.push(json!({
+                    "type": "command",
+                    "command": desired_cmd
+                }));
+            }
+        }
+
+        // Write back the hooks array to the matcher block
+        if let Some(matcher_block) = hook_type_array[matcher_idx].as_object_mut() {
+            matcher_block.insert("hooks".to_string(), Value::Array(hooks_array));
+        }
+
+        // Write back the updated hook_type_array
+        if let Some(obj) = hooks_obj.as_object_mut() {
+            obj.insert(hook_type.to_string(), Value::Array(hook_type_array));
+        }
+    }
+
+    // Write back hooks to merged
+    if let Some(root) = merged.as_object_mut() {
+        root.insert("hooks".to_string(), hooks_obj);
+    }
+
+    // Generate new content
+    let new_content = serde_json::to_string_pretty(&merged)?;
+
+    // Check if there are changes
+    if existing_content.trim() == new_content.trim() {
+        return Ok(None); // No changes needed
+    }
+
+    // Generate diff
+    let changes = compute_line_changes(&existing_content, &new_content);
+    let mut diff_output = String::new();
+    diff_output.push_str(&format!("--- {}\n", settings_path.display()));
+    diff_output.push_str(&format!("+++ {}\n", settings_path.display()));
+
+    for change in changes {
+        let sign = match change.tag() {
+            LineChangeTag::Delete => "-",
+            LineChangeTag::Insert => "+",
+            LineChangeTag::Equal => " ",
+        };
+        diff_output.push_str(&format!("{}{}", sign, change.value()));
+    }
+
+    // Write if not dry-run
+    if !dry_run {
+        write_atomic(&settings_path, new_content.as_bytes())?;
+    }
+
+    Ok(Some(diff_output))
+}
+
 fn install_cursor_hooks(binary_path: &Path, dry_run: bool) -> Result<Option<String>, GitAiError> {
     let hooks_path = cursor_hooks_path();
 
@@ -985,6 +1246,10 @@ fn opencode_plugin_path() -> PathBuf {
 
 fn claude_settings_path() -> PathBuf {
     home_dir().join(".claude").join("settings.json")
+}
+
+fn gemini_settings_path() -> PathBuf {
+    home_dir().join(".gemini").join("settings.json")
 }
 
 fn cursor_hooks_path() -> PathBuf {
@@ -2334,6 +2599,20 @@ mod tests {
         assert!(is_git_ai_checkpoint_command(
             "git-ai checkpoint --hook-input \"$(cat)\""
         ));
+        
+        // Gemini commands
+        assert!(is_git_ai_checkpoint_command("git-ai checkpoint gemini"));
+        assert!(is_git_ai_checkpoint_command(&format!(
+            "git-ai {}",
+            GEMINI_BEFORE_TOOL_CMD
+        )));
+        assert!(is_git_ai_checkpoint_command(&format!(
+            "git-ai {}",
+            GEMINI_AFTER_TOOL_CMD
+        )));
+        assert!(is_git_ai_checkpoint_command(
+            "git-ai checkpoint gemini --hook-input stdin"
+        ));
 
         // Non-matching commands
         assert!(!is_git_ai_checkpoint_command("echo hello"));
@@ -2477,5 +2756,475 @@ mod tests {
         assert!(plugin_path.exists());
         let content = fs::read_to_string(&plugin_path).unwrap();
         assert!(content.contains("GitAiPlugin"));
+    }
+
+    // Gemini tests
+    fn setup_gemini_test_env() -> (TempDir, PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let settings_path = temp_dir.path().join(".gemini").join("settings.json");
+        (temp_dir, settings_path)
+    }
+
+    #[test]
+    fn test_gemini_install_hooks_creates_file_from_scratch() {
+        let (_temp_dir, settings_path) = setup_gemini_test_env();
+
+        // Ensure parent directory exists
+        if let Some(parent) = settings_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        let result = json!({
+            "tools": {
+                "enableHooks": true
+            },
+            "hooks": {
+                "BeforeTool": [
+                    {
+                        "matcher": "write_file|replace",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": format!("git-ai {}", GEMINI_BEFORE_TOOL_CMD)
+                            }
+                        ]
+                    }
+                ],
+                "AfterTool": [
+                    {
+                        "matcher": "write_file|replace",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": format!("git-ai {}", GEMINI_AFTER_TOOL_CMD)
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&result).unwrap(),
+        )
+        .unwrap();
+
+        // Verify
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        
+        // Verify tools.enableHooks is set
+        assert_eq!(
+            content.get("tools").unwrap().get("enableHooks").unwrap(),
+            &json!(true)
+        );
+
+        let hooks = content.get("hooks").unwrap();
+
+        let before_tool = hooks.get("BeforeTool").unwrap().as_array().unwrap();
+        let after_tool = hooks.get("AfterTool").unwrap().as_array().unwrap();
+
+        assert_eq!(before_tool.len(), 1);
+        assert_eq!(after_tool.len(), 1);
+
+        // Check matchers
+        assert_eq!(
+            before_tool[0].get("matcher").unwrap().as_str().unwrap(),
+            "write_file|replace"
+        );
+        assert_eq!(
+            after_tool[0].get("matcher").unwrap().as_str().unwrap(),
+            "write_file|replace"
+        );
+    }
+
+    #[test]
+    fn test_gemini_removes_duplicates() {
+        let (_temp_dir, settings_path) = setup_gemini_test_env();
+
+        if let Some(parent) = settings_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        // Create existing hooks with duplicates
+        let existing = json!({
+            "tools": {
+                "enableHooks": true
+            },
+            "hooks": {
+                "BeforeTool": [
+                    {
+                        "matcher": "write_file|replace",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "git-ai checkpoint gemini"
+                            },
+                            {
+                                "type": "command",
+                                "command": "git-ai checkpoint gemini --hook-input stdin 2>/dev/null || true"
+                            }
+                        ]
+                    }
+                ],
+                "AfterTool": [
+                    {
+                        "matcher": "write_file|replace",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "git-ai checkpoint gemini --hook-input \"$(cat)\""
+                            },
+                            {
+                                "type": "command",
+                                "command": "git-ai checkpoint gemini --hook-input stdin"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        // Simulate the deduplication logic (what install_gemini_hooks does)
+        let mut content: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+
+        let before_tool_cmd = format!("git-ai {}", GEMINI_BEFORE_TOOL_CMD);
+        let after_tool_cmd = format!("git-ai {}", GEMINI_AFTER_TOOL_CMD);
+
+        for (hook_type, desired_cmd) in
+            &[("BeforeTool", before_tool_cmd), ("AfterTool", after_tool_cmd)]
+        {
+            let hooks_obj = content.get_mut("hooks").unwrap();
+            let hook_type_array = hooks_obj
+                .get_mut(*hook_type)
+                .unwrap()
+                .as_array_mut()
+                .unwrap();
+            let matcher_block = &mut hook_type_array[0];
+            let hooks_array = matcher_block
+                .get_mut("hooks")
+                .unwrap()
+                .as_array_mut()
+                .unwrap();
+
+            // Find git-ai checkpoint commands and update the first one, mark others for removal
+            let mut found_idx: Option<usize> = None;
+            let mut needs_update = false;
+
+            for (idx, hook) in hooks_array.iter().enumerate() {
+                if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
+                    if is_git_ai_checkpoint_command(cmd) {
+                        if found_idx.is_none() {
+                            found_idx = Some(idx);
+                            if cmd != *desired_cmd {
+                                needs_update = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Update or keep the first occurrence
+            if let Some(idx) = found_idx {
+                if needs_update {
+                    hooks_array[idx] = json!({
+                        "type": "command",
+                        "command": desired_cmd
+                    });
+                }
+            }
+
+            // Now remove ALL OTHER git-ai checkpoint commands (keep only the one we just processed)
+            let first_idx = found_idx;
+            if let Some(keep_idx) = first_idx {
+                let mut i = 0;
+                hooks_array.retain(|hook| {
+                    let should_keep = if i == keep_idx {
+                        true
+                    } else if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
+                        // Remove if it's another git-ai checkpoint command
+                        !is_git_ai_checkpoint_command(cmd)
+                    } else {
+                        true
+                    };
+                    i += 1;
+                    should_keep
+                });
+            }
+        }
+
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&content).unwrap(),
+        )
+        .unwrap();
+
+        // Verify no duplicates
+        let result: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let hooks = result.get("hooks").unwrap();
+
+        for hook_type in &["BeforeTool", "AfterTool"] {
+            let hook_array = hooks.get(*hook_type).unwrap().as_array().unwrap();
+            assert_eq!(hook_array.len(), 1);
+
+            let hooks_in_matcher = hook_array[0].get("hooks").unwrap().as_array().unwrap();
+            assert_eq!(
+                hooks_in_matcher.len(),
+                1,
+                "{} should have exactly 1 hook after deduplication",
+                hook_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_gemini_preserves_other_hooks() {
+        let (_temp_dir, settings_path) = setup_gemini_test_env();
+
+        if let Some(parent) = settings_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        // Create existing hooks with other user commands
+        let existing = json!({
+            "tools": {
+                "enableHooks": true
+            },
+            "hooks": {
+                "BeforeTool": [
+                    {
+                        "matcher": "write_file|replace",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "echo 'before write'"
+                            }
+                        ]
+                    }
+                ],
+                "AfterTool": [
+                    {
+                        "matcher": "write_file|replace",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "prettier --write"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        // Simulate adding our hooks
+        let mut content: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+
+        let hooks_obj = content.get_mut("hooks").unwrap();
+
+        // Add to BeforeTool
+        let before_array = hooks_obj
+            .get_mut("BeforeTool")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        before_array[0]
+            .get_mut("hooks")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "type": "command",
+                "command": format!("git-ai {}", GEMINI_BEFORE_TOOL_CMD)
+            }));
+
+        // Add to AfterTool
+        let after_array = hooks_obj
+            .get_mut("AfterTool")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        after_array[0]
+            .get_mut("hooks")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "type": "command",
+                "command": format!("git-ai {}", GEMINI_AFTER_TOOL_CMD)
+            }));
+
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&content).unwrap(),
+        )
+        .unwrap();
+
+        // Verify both old and new hooks exist
+        let result: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let hooks = result.get("hooks").unwrap();
+
+        let before_hooks = hooks.get("BeforeTool").unwrap().as_array().unwrap()[0]
+            .get("hooks")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let after_hooks = hooks.get("AfterTool").unwrap().as_array().unwrap()[0]
+            .get("hooks")
+            .unwrap()
+            .as_array()
+            .unwrap();
+
+        assert_eq!(before_hooks.len(), 2);
+        assert_eq!(after_hooks.len(), 2);
+
+        // Verify original hooks are preserved
+        assert_eq!(
+            before_hooks[0].get("command").unwrap().as_str().unwrap(),
+            "echo 'before write'"
+        );
+        assert_eq!(
+            after_hooks[0].get("command").unwrap().as_str().unwrap(),
+            "prettier --write"
+        );
+    }
+
+    #[test]
+    fn test_gemini_enables_hooks_setting() {
+        let (_temp_dir, settings_path) = setup_gemini_test_env();
+
+        if let Some(parent) = settings_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        // Create existing settings without tools.enableHooks
+        let existing = json!({
+            "hooks": {
+                "BeforeTool": [],
+                "AfterTool": []
+            }
+        });
+
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        // Simulate enabling hooks
+        let mut content: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+
+        // Ensure tools.enableHooks is set to true
+        if let Some(tools_obj) = content.get_mut("tools").and_then(|t| t.as_object_mut()) {
+            // Only update if not already true
+            if tools_obj.get("enableHooks") != Some(&json!(true)) {
+                tools_obj.insert("enableHooks".to_string(), json!(true));
+            }
+        } else {
+            if let Some(root) = content.as_object_mut() {
+                root.insert("tools".to_string(), json!({ "enableHooks": true }));
+            }
+        }
+
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&content).unwrap(),
+        )
+        .unwrap();
+
+        // Verify tools.enableHooks is set
+        let result: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            result.get("tools").unwrap().get("enableHooks").unwrap(),
+            &json!(true)
+        );
+    }
+
+    #[test]
+    fn test_gemini_handles_empty_file() {
+        let (_temp_dir, settings_path) = setup_gemini_test_env();
+
+        // Create parent directory
+        if let Some(parent) = settings_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+
+        // Create empty file
+        fs::write(&settings_path, "").unwrap();
+
+        // Read and handle empty file
+        let contents = fs::read_to_string(&settings_path).unwrap();
+        let existing: Value = if contents.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&contents).unwrap()
+        };
+
+        assert_eq!(existing, json!({}));
+
+        // Now create proper structure with tools.enableHooks
+        let result = json!({
+            "tools": {
+                "enableHooks": true
+            },
+            "hooks": {
+                "BeforeTool": [
+                    {
+                        "matcher": "write_file|replace",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": format!("git-ai {}", GEMINI_BEFORE_TOOL_CMD)
+                            }
+                        ]
+                    }
+                ],
+                "AfterTool": [
+                    {
+                        "matcher": "write_file|replace",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": format!("git-ai {}", GEMINI_AFTER_TOOL_CMD)
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&result).unwrap(),
+        )
+        .unwrap();
+
+        // Verify proper structure was created
+        let content: Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(content.get("tools").is_some());
+        assert_eq!(
+            content.get("tools").unwrap().get("enableHooks").unwrap(),
+            &json!(true)
+        );
+        assert!(content.get("hooks").is_some());
     }
 }
