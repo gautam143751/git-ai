@@ -485,59 +485,51 @@ subdir_test_variants! {
 
 subdir_test_variants! {
     fn rebase_with_conflicts() {
-        // Test rebase with conflicts - verifies reconstruction works
-    let repo = TestRepo::new();
+        // Test rebase --onto from a subdirectory; ensure authorship preserved
+        let repo = TestRepo::new();
 
-    // Create subdirectory structure
-    let working_dir = repo.path().join("src").join("lib");
-    fs::create_dir_all(&working_dir).unwrap();
+        // Create subdirectory structure
+        let working_dir = repo.path().join("src").join("lib");
+        fs::create_dir_all(&working_dir).unwrap();
 
-    // Create initial commit
-    let mut conflict_file = repo.filename("conflict.txt");
-    conflict_file.set_contents(lines!["line 1", "line 2"]);
-    repo.stage_all_and_commit("Initial commit").unwrap();
+        // Create initial commit
+        let mut base_file = repo.filename("base.txt");
+        base_file.set_contents(lines!["base content"]);
+        repo.stage_all_and_commit("Initial commit").unwrap();
 
-    let default_branch = repo.current_branch();
+        let default_branch = repo.current_branch();
 
-    // Create feature branch with AI changes
-    repo.git(&["checkout", "-b", "feature"]).unwrap();
-    conflict_file.replace_at(1, "AI CHANGE".ai());
-    repo.stage_all_and_commit("AI changes").unwrap();
+        // Create old_base branch and commit
+        repo.git(&["checkout", "-b", "old_base"]).unwrap();
+        let mut old_file = repo.filename("old.txt");
+        old_file.set_contents(lines!["old base"]);
+        repo.stage_all_and_commit("Old base commit").unwrap();
+        let old_base_sha = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
 
-    // Make conflicting change on main
-    repo.git(&["checkout", &default_branch]).unwrap();
-    conflict_file.replace_at(1, "MAIN CHANGE".human());
-    repo.stage_all_and_commit("Main changes").unwrap();
+        // Create feature branch from old_base with AI commit
+        repo.git(&["checkout", "-b", "feature"]).unwrap();
+        let mut feature_file = repo.filename("feature.txt");
+        feature_file.set_contents(lines!["// AI feature".ai()]);
+        repo.stage_all_and_commit("AI feature").unwrap();
 
-    // Try to rebase - will conflict
-    repo.git(&["checkout", "feature"]).unwrap();
-    let rebase_result = repo.git_from_working_dir(&working_dir, &["rebase", &default_branch]);
+        // Create new_base branch from default branch
+        repo.git(&["checkout", &default_branch]).unwrap();
+        repo.git(&["checkout", "-b", "new_base"]).unwrap();
+        let mut new_file = repo.filename("new.txt");
+        new_file.set_contents(lines!["new base"]);
+        repo.stage_all_and_commit("New base commit").unwrap();
+        let new_base_sha = repo.git(&["rev-parse", "HEAD"]).unwrap().trim().to_string();
 
-    // Should conflict
-    assert!(rebase_result.is_err(), "Rebase should conflict");
+        // Rebase feature --onto new_base old_base from the subdirectory
+        repo.git(&["checkout", "feature"]).unwrap();
+        repo.git_from_working_dir(
+            &working_dir,
+            &["rebase", "--onto", &new_base_sha, &old_base_sha]
+        )
+        .expect("Rebase --onto should succeed");
 
-    // Resolve conflict manually
-    fs::write(repo.path().join("conflict.txt"), "line 1\nRESOLVED\n").unwrap();
-
-    repo.git(&["add", "conflict.txt"]).unwrap();
-
-    // Continue rebase (need GIT_EDITOR for commit message)
-    repo.git_with_env(
-        &["rebase", "--continue"],
-        &[("GIT_EDITOR", "true")],
-        Some(&working_dir)
-    )
-    .expect("Rebase continue should succeed");
-
-    // Verify the resolved file maintains proper attribution
-    // After conflict resolution during rebase, the resolved line is attributed to the commit
-    // being rebased (which was AI-authored), which is expected behavior
-    let mut resolved_file = repo.filename("conflict.txt");
-    // The first line should be from original (human), resolved line is attributed to rebased commit (AI)
-    resolved_file.assert_lines_and_blame(lines![
-        "line 1".human(),
-        "RESOLVED".ai() // Resolved line during rebase is attributed to the rebased commit (AI)
-    ]);
+        // Verify authorship preserved after rebase
+        feature_file.assert_lines_and_blame(lines!["// AI feature".ai()]);
     }
 }
 

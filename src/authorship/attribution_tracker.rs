@@ -7,9 +7,11 @@ use crate::authorship::imara_diff_utils::{ByteDiff, ByteDiffOp, DiffOp, capture_
 use crate::authorship::move_detection::{DeletedLine, InsertedLine, detect_moves};
 use crate::authorship::working_log::CheckpointKind;
 use crate::error::GitAiError;
+use crate::utils::debug_log;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::time::Instant;
 
 pub const INITIAL_ATTRIBUTION_TS: u128 = 42;
 
@@ -295,9 +297,16 @@ impl AttributionTracker {
         old_content: &str,
         new_content: &str,
     ) -> Result<DiffComputation, GitAiError> {
+        let compute_start = Instant::now();
+        let line_metadata_start = Instant::now();
         let old_lines = collect_line_metadata(old_content);
         let new_lines = collect_line_metadata(new_content);
+        debug_log(&format!(
+            "[BENCHMARK] collect_line_metadata (old/new) took {:?}",
+            line_metadata_start.elapsed()
+        ));
 
+        let capture_start = Instant::now();
         let old_line_slices: Vec<&str> = old_lines
             .iter()
             .map(|line| &old_content[line.start..line.end])
@@ -308,9 +317,16 @@ impl AttributionTracker {
             .collect();
 
         let line_ops = capture_diff_slices(&old_line_slices, &new_line_slices);
+        let line_ops_len = line_ops.len();
+        debug_log(&format!(
+            "[BENCHMARK] capture_diff_slices produced {} ops in {:?}",
+            line_ops_len,
+            capture_start.elapsed()
+        ));
 
         let mut computation = DiffComputation::default();
         let mut pending_changed: Vec<DiffOp> = Vec::new();
+        let process_start = Instant::now();
 
         for op in line_ops.into_iter() {
             if matches!(op, DiffOp::Equal { .. }) {
@@ -344,6 +360,12 @@ impl AttributionTracker {
         }
 
         computation.substantive_new_ranges = merge_ranges(computation.substantive_new_ranges);
+        debug_log(&format!(
+            "[BENCHMARK] compute_diffs processed {} ops in {:?} (total {:?})",
+            line_ops_len,
+            process_start.elapsed(),
+            compute_start.elapsed()
+        ));
 
         Ok(computation)
     }
@@ -1030,6 +1052,45 @@ fn line_range_to_byte_range(
     (start, end)
 }
 
+/// Check if a character is a single-character operator or delimiter
+fn is_operator_or_delimiter(ch: char) -> bool {
+    matches!(
+        ch,
+        '+' | '-' | '*' | '/' | '%' | '=' | '<' | '>' | '!' | '&' | '|' | '^' | '~' | '?' | '@'
+            | ';' | ',' | '.' | ':' | '(' | ')' | '{' | '}' | '[' | ']'
+    )
+}
+
+/// Try to match a multi-character operator by peeking ahead
+fn try_match_multi_char_op(ch: char, peek: Option<char>) -> Option<&'static str> {
+    match (ch, peek) {
+        ('=', Some('=')) => Some("=="),
+        ('!', Some('=')) => Some("!="),
+        ('<', Some('=')) => Some("<="),
+        ('>', Some('=')) => Some(">="),
+        ('&', Some('&')) => Some("&&"),
+        ('|', Some('|')) => Some("||"),
+        (':', Some(':')) => Some("::"),
+        ('-', Some('>')) => Some("->"),
+        ('=', Some('>')) => Some("=>"),
+        ('.', Some('.')) => Some(".."),
+        ('+', Some('+')) => Some("++"),
+        ('-', Some('-')) => Some("--"),
+        ('+', Some('=')) => Some("+="),
+        ('-', Some('=')) => Some("-="),
+        ('*', Some('=')) => Some("*="),
+        ('/', Some('=')) => Some("/="),
+        ('%', Some('=')) => Some("%="),
+        ('&', Some('=')) => Some("&="),
+        ('|', Some('=')) => Some("|="),
+        ('^', Some('=')) => Some("^="),
+        ('<', Some('<')) => Some("<<"),
+        ('>', Some('>')) => Some(">>"),
+        _ => None,
+    }
+}
+
+/// Code-optimized tokenizer that treats syntactic elements as meaningful units
 fn tokenize_non_whitespace(
     content: &str,
     range: (usize, usize),
@@ -1043,24 +1104,202 @@ fn tokenize_non_whitespace(
     let mut tokens = Vec::new();
     let mut line = starting_line;
 
-    for (offset, ch) in content[start..end].char_indices() {
-        let abs = start + offset;
+    let mut i = start;
+    while i < end {
+        let ch = match content[i..].chars().next() {
+            Some(c) => c,
+            None => break,
+        };
+        let ch_len = ch.len_utf8();
+
+        // Skip whitespace (track newlines for line counting)
         if ch.is_whitespace() {
             if ch == '\n' {
                 line += 1;
             }
+            i += ch_len;
             continue;
         }
 
-        let mut buf = [0u8; 4];
-        let lexeme = ch.encode_utf8(&mut buf).to_string();
-        let ch_end = abs + ch.len_utf8();
+        // Peek ahead for multi-character operators
+        let peek = content[i + ch_len..end].chars().next();
+        if let Some(op) = try_match_multi_char_op(ch, peek) {
+            let op_len = op.len();
+            tokens.push(Token {
+                lexeme: op.to_string(),
+                start: i,
+                end: i + op_len,
+                line,
+            });
+            i += op_len;
+            continue;
+        }
+
+        // String literals (single token, handle escape sequences)
+        if ch == '"' || ch == '\'' || ch == '`' {
+            let quote_char = ch;
+            let mut lexeme = String::new();
+            lexeme.push(ch);
+            let token_start = i;
+            i += ch_len;
+
+            let mut escaped = false;
+            while i < end {
+                let str_ch = match content[i..].chars().next() {
+                    Some(c) => c,
+                    None => break,
+                };
+                let str_ch_len = str_ch.len_utf8();
+                lexeme.push(str_ch);
+
+                if str_ch == '\n' {
+                    line += 1;
+                }
+
+                if escaped {
+                    escaped = false;
+                } else if str_ch == '\\' {
+                    escaped = true;
+                } else if str_ch == quote_char {
+                    i += str_ch_len;
+                    break;
+                }
+
+                i += str_ch_len;
+            }
+
+            tokens.push(Token {
+                lexeme,
+                start: token_start,
+                end: i,
+                line,
+            });
+            continue;
+        }
+
+        // Numbers (including hex, octal, binary, floats, scientific notation)
+        if ch.is_ascii_digit() || (ch == '.' && i + ch_len < end && content[i + ch_len..].chars().next().map_or(false, |c| c.is_ascii_digit())) {
+            let mut lexeme = String::new();
+            let token_start = i;
+
+            // Handle hex (0x), octal (0o), binary (0b) prefixes
+            if ch == '0' && i + 1 < end {
+                let next_ch = content[i + 1..].chars().next().unwrap();
+                if next_ch == 'x' || next_ch == 'X' || next_ch == 'o' || next_ch == 'O' || next_ch == 'b' || next_ch == 'B' {
+                    lexeme.push(ch);
+                    lexeme.push(next_ch);
+                    i += 1 + next_ch.len_utf8();
+
+                    // Consume hex/octal/binary digits
+                    while i < end {
+                        let digit_ch = match content[i..].chars().next() {
+                            Some(c) => c,
+                            None => break,
+                        };
+                        if digit_ch.is_ascii_alphanumeric() || digit_ch == '_' {
+                            lexeme.push(digit_ch);
+                            i += digit_ch.len_utf8();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    tokens.push(Token {
+                        lexeme,
+                        start: token_start,
+                        end: i,
+                        line,
+                    });
+                    continue;
+                }
+            }
+
+            // Regular decimal number
+            while i < end {
+                let num_ch = match content[i..].chars().next() {
+                    Some(c) => c,
+                    None => break,
+                };
+                let num_ch_len = num_ch.len_utf8();
+
+                if num_ch.is_ascii_digit() || num_ch == '.' || num_ch == '_' {
+                    lexeme.push(num_ch);
+                    i += num_ch_len;
+                } else if (num_ch == 'e' || num_ch == 'E') && i + num_ch_len < end {
+                    // Scientific notation
+                    lexeme.push(num_ch);
+                    i += num_ch_len;
+                    // Handle optional +/- after e
+                    if i < end {
+                        let sign_ch = content[i..].chars().next().unwrap();
+                        if sign_ch == '+' || sign_ch == '-' {
+                            lexeme.push(sign_ch);
+                            i += sign_ch.len_utf8();
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            tokens.push(Token {
+                lexeme,
+                start: token_start,
+                end: i,
+                line,
+            });
+            continue;
+        }
+
+        // Identifiers (alphanumeric + underscore, start with letter or underscore)
+        if ch.is_alphabetic() || ch == '_' {
+            let mut lexeme = String::new();
+            let token_start = i;
+
+            while i < end {
+                let id_ch = match content[i..].chars().next() {
+                    Some(c) => c,
+                    None => break,
+                };
+                let id_ch_len = id_ch.len_utf8();
+
+                if id_ch.is_alphanumeric() || id_ch == '_' {
+                    lexeme.push(id_ch);
+                    i += id_ch_len;
+                } else {
+                    break;
+                }
+            }
+
+            tokens.push(Token {
+                lexeme,
+                start: token_start,
+                end: i,
+                line,
+            });
+            continue;
+        }
+
+        // Single-character operators and delimiters
+        if is_operator_or_delimiter(ch) {
+            tokens.push(Token {
+                lexeme: ch.to_string(),
+                start: i,
+                end: i + ch_len,
+                line,
+            });
+            i += ch_len;
+            continue;
+        }
+
+        // Fallback: unknown characters as single tokens
         tokens.push(Token {
-            lexeme,
-            start: abs,
-            end: ch_end,
+            lexeme: ch.to_string(),
+            start: i,
+            end: i + ch_len,
             line,
         });
+        i += ch_len;
     }
 
     tokens
@@ -1719,6 +1958,63 @@ mod tests {
         assert!(
             line_attrs.iter().all(|la| la.author_id == "Alice"),
             "every reflowed line should remain Alice, got {:?}",
+            line_attrs
+        );
+    }
+
+    #[test]
+    fn line_reflow_without_token_change_is_non_substantive_with_semicolon() {
+        let tracker = AttributionTracker::new();
+        let old = "call(foo, bar, baz);";
+        let new = "call(\n  foo,\n  bar,\n  baz\n);";
+        let old_attrs = vec![Attribution::new(0, old.len(), "Alice".into(), TEST_TS)];
+
+        let updated = tracker
+            .update_attributions(old, new, &old_attrs, "Bob", TEST_TS + 1)
+            .unwrap();
+
+        let line_attrs = attributions_to_line_attributions(&updated, new);
+        assert!(
+            line_attrs.iter().all(|la| la.author_id == "Alice"),
+            "every reflowed line should remain Alice, got {:?}",
+            line_attrs
+        );
+    }
+
+    #[test]
+    fn adding_semicolon_is_substantive() {
+        let tracker = AttributionTracker::new();
+        let old = "call(foo, bar, baz)";
+        let new = "call(foo, bar, baz);";
+        let old_attrs = vec![Attribution::new(0, old.len(), "Alice".into(), TEST_TS)];
+
+        let updated = tracker
+            .update_attributions(old, new, &old_attrs, "Bob", TEST_TS + 1)
+            .unwrap();
+
+        let line_attrs = attributions_to_line_attributions(&updated, new);
+        assert!(
+            line_attrs.iter().all(|la| la.author_id == "Bob"),
+            "adding semicolon should be substantive, got {:?}",
+            line_attrs
+        );
+    }
+
+    #[test]
+    fn reflow_complex_if_statement_is_non_substantive() {
+        let tracker = AttributionTracker::new();
+        let old = "if (foo && bar || baz) { println!(\"condition\"); }";
+        let new = "if (foo\n    && bar\n    || baz) {\n    println!(\"condition\");\n}";
+        let old_attrs = vec![Attribution::new(0, old.len(), "Alice".into(), TEST_TS)];
+
+        let updated = tracker
+            .update_attributions(old, new, &old_attrs, "Bob", TEST_TS + 1)
+            .unwrap();
+
+        let line_attrs = attributions_to_line_attributions(&updated, new);
+        assert!(
+            line_attrs.iter().all(|la| la.author_id == "Alice"),
+            "reflow of complex if statement should not be substantive, got {:?}",
             line_attrs
         );
     }
