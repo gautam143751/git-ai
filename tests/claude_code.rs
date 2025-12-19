@@ -99,7 +99,13 @@ fn test_claude_preset_no_filepath_when_tool_input_missing() {
 fn test_claude_e2e_prefers_latest_checkpoint_for_prompts() {
     use repos::test_repo::TestRepo;
 
-    let repo = TestRepo::new();
+    let mut repo = TestRepo::new();
+    
+    // Enable prompt sharing for all repositories
+    repo.patch_git_ai_config(|patch| {
+        patch.share_prompts_in_repositories = Some(vec!["*".to_string()]);
+    });
+    
     let repo_root = repo.canonical_path();
 
     // Create initial file and commit

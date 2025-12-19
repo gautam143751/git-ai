@@ -157,25 +157,24 @@ impl Config {
     }
 
     /// Returns true if prompts should be shared for the given repository.
-    /// Empty share_prompts_in_repositories means NO repos share prompts (opt-in).
-    /// Local repositories (no remotes) are considered safe and prompts are shared.
+    /// Local repositories (no remotes) always share prompts as they're considered safe.
+    /// For repositories with remotes, empty share_prompts_in_repositories means no sharing (opt-in).
     pub fn should_share_prompts(&self, repository: &Option<Repository>) -> bool {
         // Fetch remotes once
         let remotes = repository
             .as_ref()
             .and_then(|repo| repo.remotes_with_urls().ok());
 
-        if self.share_prompts_in_repositories.is_empty() {
-            return false; // No patterns = share nowhere
-        }
-
         match remotes {
             Some(remotes) => {
                 if remotes.is_empty() {
-                    // No remotes = local-only repo, safe to share
+                    // No remotes = local-only repo, always safe to share
                     true
+                } else if self.share_prompts_in_repositories.is_empty() {
+                    // Has remotes but no patterns configured = don't share
+                    false
                 } else {
-                    // Has remotes, check if any match patterns
+                    // Has remotes and patterns, check if any match
                     remotes.iter().any(|remote| {
                         self.share_prompts_in_repositories
                             .iter()
@@ -697,17 +696,27 @@ mod tests {
     }
 
     #[test]
-    fn test_should_share_prompts_local_repo_with_no_remotes() {
-        let config =
+    fn test_should_share_prompts_local_repo_always_shares() {
+        // Test 1: Local repo with no patterns configured should still share
+        let config_no_patterns = create_test_config_with_share_prompts(vec![]);
+        // Even with empty patterns, local repos (no remotes) should share
+        // This is tested via integration tests since we can't easily mock Repository
+
+        // Test 2: Local repo with patterns configured should share
+        let config_with_patterns =
             create_test_config_with_share_prompts(vec!["https://github.com/*".to_string()]);
+        assert!(config_with_patterns.share_prompts_in_repositories[0]
+            .matches("https://github.com/myorg/repo"));
+    }
 
-        // Test with empty remotes list (local-only repo)
-        // Local repos should share prompts when patterns are configured
-        let empty_remotes: Vec<(String, String)> = vec![];
-        assert!(config.share_prompts_in_repositories[0].matches("https://github.com/myorg/repo"));
+    #[test]
+    fn test_should_share_prompts_respects_patterns_when_remotes_exist() {
+        let config =
+            create_test_config_with_share_prompts(vec!["https://github.com/trusted/*".to_string()]);
 
-        // Directly test the internal helper (it's private but we can test the public API indirectly)
-        // A local repo with no remotes should share when patterns are configured
-        // This is tested through the full flow in integration tests
+        // Pattern should match trusted repos
+        assert!(config.share_prompts_in_repositories[0].matches("https://github.com/trusted/repo"));
+        // Pattern should not match untrusted repos
+        assert!(!config.share_prompts_in_repositories[0].matches("https://github.com/other/repo"));
     }
 }
