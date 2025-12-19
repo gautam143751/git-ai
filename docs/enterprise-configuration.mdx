@@ -16,7 +16,7 @@ All options in `config.json` are optional and will fall back to default values i
 | Option | Type | Description | Default |
 | --- | --- | --- | --- |
 | `git_path` | `Path` | The path to the (unaltered) `git` binary you distribute on developer machines | Whichever git is on the shell path |
-| `share_prompts_in_repositories` | `Pattern[]` | Share prompts in authorship logs only for repositories matching these patterns. Supports glob patterns (e.g., `https://github.com/myorg/*`) | Empty list (prompts not shared by default as of v1.0.24) |
+| `share_prompts_in_repositories` | `Pattern[]` | Share prompts in authorship logs only for repositories matching these patterns. Supports glob patterns (e.g., `https://github.com/myorg/*`) | Empty list (prompts not shared by default as of v1.0.25) |
 | `allow_repositories` | `Pattern[]` | Allow `git-ai` in only these remotes. Supports glob patterns (e.g., `https://github.com/myorg/*`) | If not specified or set to an empty list, all repositories are allowed |
 | `exclude_repositories` | `Pattern[]` | Exclude `git-ai` from these remotes. Supports glob patterns (e.g., `https://github.com/myorg/*`) | If a repository is present in both allow and exclude lists, exclusion takes precedence |
 | `telemetry_oss` | `"off"` | Disable OSS performance metrics and error logging sent to Git AI maintainers | Defaults to enabled |
