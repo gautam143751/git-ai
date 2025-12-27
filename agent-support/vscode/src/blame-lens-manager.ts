@@ -12,6 +12,11 @@ export class BlameLensManager implements vscode.CodeLensProvider {
   private _onDidChangeCodeLenses: vscode.EventEmitter<void> = new vscode.EventEmitter<void>();
   public readonly onDidChangeCodeLenses: vscode.Event<void> = this._onDidChangeCodeLenses.event;
   
+  // Virtual document provider for markdown content
+  private static readonly VIRTUAL_SCHEME = 'git-ai-blame';
+  private markdownContentStore: Map<string, string> = new Map();
+  private _onDidChangeVirtualDocument: vscode.EventEmitter<vscode.Uri> = new vscode.EventEmitter<vscode.Uri>();
+  
   // Decoration types for colored borders (one per color)
   private colorDecorations: vscode.TextEditorDecorationType[] = [];
   
@@ -90,6 +95,33 @@ export class BlameLensManager implements vscode.CodeLensProvider {
   }
 
   public activate(): void {
+    // Register virtual document provider for markdown content
+    const documentProvider = new class implements vscode.TextDocumentContentProvider {
+      constructor(private manager: BlameLensManager) {}
+      
+      provideTextDocumentContent(uri: vscode.Uri): string {
+        // Extract content ID from path (remove leading / and trailing .md)
+        const contentId = uri.path.replace(/^\//, '').replace(/\.md$/, '');
+        console.log('[git-ai] provideTextDocumentContent called for URI:', uri.toString());
+        console.log('[git-ai] URI path:', uri.path, 'extracted contentId:', contentId);
+        console.log('[git-ai] Available content IDs:', Array.from(this.manager.markdownContentStore.keys()));
+        const content = this.manager.markdownContentStore.get(contentId);
+        if (!content) {
+          console.error('[git-ai] Content not found for contentId:', contentId);
+          return '// Content not found\n// URI: ' + uri.toString() + '\n// Path: ' + uri.path + '\n// ContentId: ' + contentId;
+        }
+        return content;
+      }
+      
+      get onDidChange(): vscode.Event<vscode.Uri> {
+        return this.manager._onDidChangeVirtualDocument.event;
+      }
+    }(this);
+    
+    this.context.subscriptions.push(
+      vscode.workspace.registerTextDocumentContentProvider(BlameLensManager.VIRTUAL_SCHEME, documentProvider)
+    );
+    
     // Register CodeLens provider for all languages
     this.context.subscriptions.push(
       vscode.languages.registerCodeLensProvider({ scheme: '*', language: '*' }, this)
@@ -816,14 +848,36 @@ export class BlameLensManager implements vscode.CodeLensProvider {
   }
 
   /**
-   * Handle CodeLens click - show author details.
+   * Handle CodeLens click - open virtual tab with markdown content.
    */
-  private handleCodeLensClick(lineInfo: LineBlameInfo): void {
+  private async handleCodeLensClick(lineInfo: LineBlameInfo): Promise<void> {
     const hoverContent = this.buildHoverContent(lineInfo);
     const mdString = hoverContent.value;
     
-    // Show the markdown content as an information message
-    vscode.window.showInformationMessage(mdString, { modal: false });
+    // Generate a unique ID for this content (using commit hash + timestamp for uniqueness)
+    const contentId = `${lineInfo.commitHash}-${Date.now()}`;
+    
+    // Store the markdown content
+    this.markdownContentStore.set(contentId, mdString);
+    
+    // Create a virtual document URI (use three slashes for empty authority)
+    const uri = vscode.Uri.parse(`${BlameLensManager.VIRTUAL_SCHEME}:///${contentId}.md`);
+    
+    console.log('[git-ai] Opening virtual document:', uri.toString(), 'with contentId:', contentId);
+    console.log('[git-ai] URI path:', uri.path, 'authority:', uri.authority);
+    
+    // Open the virtual document in a new tab
+    try {
+      const doc = await vscode.workspace.openTextDocument(uri);
+      await vscode.window.showTextDocument(doc, {
+        viewColumn: vscode.ViewColumn.Beside,
+        preview: false
+      });
+    } catch (error) {
+      console.error('[git-ai] Failed to open virtual document:', error);
+      // Fallback to information message if virtual document fails
+      vscode.window.showInformationMessage(mdString, { modal: false });
+    }
   }
 
   private provideHover(
@@ -859,39 +913,201 @@ export class BlameLensManager implements vscode.CodeLensProvider {
 
   /**
    * Build hover content showing author details.
+   * Shows a polished chat-style conversation view with clear visual hierarchy.
    */
   private buildHoverContent(lineInfo: LineBlameInfo | undefined): vscode.MarkdownString {
     const md = new vscode.MarkdownString();
     md.isTrusted = true;
+    md.supportHtml = true;
 
     if (!lineInfo || !lineInfo.isAiAuthored) {
-      md.appendMarkdown('**Author:** Human\n\n');
-      md.appendText('This line was written by a human.');
+      md.appendMarkdown('👤 **Human-authored code**\n');
       return md;
     }
 
     const record = lineInfo.promptRecord;
-    const model = record?.agent_id?.model || lineInfo.author;
-    const tool = lineInfo.author.charAt(0).toUpperCase() + lineInfo.author.slice(1);
-    
-    md.appendMarkdown(`🤖 **${model}**\n\n`);
-    md.appendMarkdown(`**Tool:** ${tool}\n\n`);
-    
-    if (record?.human_author) {
-      md.appendMarkdown(`**Paired with:** ${record.human_author}\n\n`);
-    }
-    
-    // Show the first user message as context
-    const userMessage = record?.messages?.find(m => m.type === 'user');
-    if (userMessage?.text) {
-      const truncatedText = userMessage.text.length > 200 
-        ? userMessage.text.substring(0, 200) + '...' 
-        : userMessage.text;
-      md.appendMarkdown('**Prompt:**\n');
-      md.appendCodeblock(truncatedText, 'markdown');
+    const messages = record?.messages || [];
+    const hasMessages = messages.length > 0 && messages.some(m => m.text);
+
+    // Fallback if no messages saved
+    if (!hasMessages) {
+      md.appendMarkdown('🔒 *Transcript not saved*\n\n');
+      md.appendMarkdown('Enable prompt saving:\n');
+      md.appendCodeblock('git-ai config set --add share_prompts_in_repositories "*"', 'bash');
+      return md;
     }
 
+    // Parse timestamps and calculate relative times
+    const messagesWithTimestamps = messages.map((msg, index) => {
+      let timestamp: Date | null = null;
+      if (msg.timestamp) {
+        timestamp = new Date(msg.timestamp);
+      }
+      return { ...msg, parsedTimestamp: timestamp, originalIndex: index };
+    });
+
+    // Use message 0 as the base if it has a timestamp, otherwise find the first message with a timestamp
+    const baseMessage = messagesWithTimestamps[0]?.parsedTimestamp 
+      ? messagesWithTimestamps[0]
+      : messagesWithTimestamps.find(m => m.parsedTimestamp);
+    const baseTimestamp = baseMessage?.parsedTimestamp;
+    const baseIndex = baseMessage?.originalIndex ?? -1;
+
+    // Calculate time formats for all messages
+    const timeFormats = messagesWithTimestamps.map((msg, index) => {
+      if (!msg.parsedTimestamp) {
+        return null;
+      }
+      if (index === baseIndex) {
+        // Base message (preferably message 0): show actual date/time
+        return this.formatAbsoluteTimestamp(msg.parsedTimestamp);
+      } else if (baseTimestamp) {
+        // Subsequent messages: show relative time from base message
+        const diffMs = msg.parsedTimestamp.getTime() - baseTimestamp.getTime();
+        return this.formatRelativeTime(diffMs);
+      }
+      return null;
+    });
+
+    // ═══════════════════════════════════════════════════════════════
+    // USER SECTION
+    // ═══════════════════════════════════════════════════════════════
+    const humanName = this.extractHumanName(record?.human_author || '');
+    md.appendMarkdown(`### 💬 ${humanName}\n\n`);
+
+    // Get timestamp from last user message to show right after header
+    const userMessages = messagesWithTimestamps.filter(m => m.type === 'user');
+    const lastUserMessage = userMessages.length > 0 ? userMessages[userMessages.length - 1] : null;
+    const lastUserTimestamp = lastUserMessage ? timeFormats[lastUserMessage.originalIndex] : null;
+    if (lastUserTimestamp) {
+      md.appendMarkdown(`*${lastUserTimestamp}*\n\n`);
+    }
+
+    // User messages with left padding via blockquote
+    for (const msg of userMessages) {
+      if (msg.text) {
+        md.appendMarkdown(this.formatMessageWithPadding(msg.text) + '\n\n');
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // AI SECTION
+    // ═══════════════════════════════════════════════════════════════
+    const model = record?.agent_id?.model || '';
+    const tool = record?.agent_id?.tool || lineInfo.author;
+    const toolCapitalized = tool.charAt(0).toUpperCase() + tool.slice(1);
+    
+    // Build AI header: show "model tool" or just "tool" if model is default/auto/empty
+    const modelLower = model.toLowerCase();
+    const hideModel = !model || modelLower === 'default' || modelLower === 'auto';
+    const aiHeader = hideModel ? toolCapitalized : `${model} ${toolCapitalized}`;
+    
+    md.appendMarkdown(`---\n\n`);
+    md.appendMarkdown(`### 🤖 ${aiHeader}\n\n`);
+
+    // Get timestamp from last assistant message to show right after header
+    const assistantMessages = messagesWithTimestamps.filter(m => m.type === 'assistant');
+    const lastAssistantMessage = assistantMessages.length > 0 ? assistantMessages[assistantMessages.length - 1] : null;
+    const lastAssistantTimestamp = lastAssistantMessage ? timeFormats[lastAssistantMessage.originalIndex] : null;
+    if (lastAssistantTimestamp) {
+      md.appendMarkdown(`*${lastAssistantTimestamp}*\n\n`);
+    }
+
+    // Assistant responses with left padding via blockquote
+    for (const msg of assistantMessages) {
+      if (msg.text) {
+        md.appendMarkdown(this.formatMessageWithPadding(msg.text) + '\n\n');
+      }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // FOOTER
+    // ═══════════════════════════════════════════════════════════════
+    md.appendMarkdown(`---\n\n`);
+    
+    // Accepted lines count with checkmark
+    const acceptedLines = record?.accepted_lines;
+    if (acceptedLines !== undefined && acceptedLines > 0) {
+      md.appendMarkdown(`✅ **+${acceptedLines} accepted lines**\n\n`);
+    }
+
+    // Other files section (placeholder)
+    md.appendMarkdown(`📁 **Other files:** *coming soon*\n`);
+
     return md;
+  }
+
+  /**
+   * Format an absolute timestamp for the first message.
+   * Shows a readable date/time format.
+   */
+  private formatAbsoluteTimestamp(date: Date): string {
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const messageDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    
+    // If it's today, show time only
+    if (messageDate.getTime() === today.getTime()) {
+      return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+    
+    // If it's this year, show month and day
+    if (date.getFullYear() === now.getFullYear()) {
+      return date.toLocaleDateString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    }
+    
+    // Otherwise show full date
+    return date.toLocaleDateString([], { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  }
+
+  /**
+   * Format a relative time difference for subsequent messages.
+   * Shows increments like "5 mins later", "1 hr later", etc.
+   */
+  private formatRelativeTime(diffMs: number): string {
+    const diffSeconds = Math.floor(diffMs / 1000);
+    const diffMinutes = Math.floor(diffSeconds / 60);
+    const diffHours = Math.floor(diffMinutes / 60);
+    const diffDays = Math.floor(diffHours / 24);
+    
+    if (diffDays > 0) {
+      return `${diffDays} ${diffDays === 1 ? 'day' : 'days'} later`;
+    } else if (diffHours > 0) {
+      return `${diffHours} ${diffHours === 1 ? 'hr' : 'hrs'} later`;
+    } else if (diffMinutes > 0) {
+      return `${diffMinutes} ${diffMinutes === 1 ? 'min' : 'mins'} later`;
+    } else if (diffSeconds > 0) {
+      return `${diffSeconds} ${diffSeconds === 1 ? 'sec' : 'secs'} later`;
+    } else {
+      return 'just now';
+    }
+  }
+
+  /**
+   * Format a message for display in the hover with left padding.
+   * Uses blockquotes to create a left border/indent effect.
+   * Preserves markdown formatting while keeping reasonable length.
+   */
+  private formatMessageWithPadding(text: string): string {
+    // Trim excessive whitespace but preserve structure
+    let content = text.trim();
+    
+    // If message is very long, show first portion with indicator
+    const MAX_CHARS = 2000;
+    if (content.length > MAX_CHARS) {
+      const truncated = content.substring(0, MAX_CHARS);
+      // Try to break at a word boundary
+      const lastSpace = truncated.lastIndexOf(' ');
+      const breakPoint = lastSpace > MAX_CHARS - 200 ? lastSpace : MAX_CHARS;
+      content = truncated.substring(0, breakPoint) + '\n\n*... message truncated ...*';
+    }
+    
+    // Convert to blockquote for left padding effect
+    // Each line gets prefixed with "> "
+    return content
+      .split('\n')
+      .map(line => '> ' + line)
+      .join('\n');
   }
 
   /**
@@ -938,7 +1154,7 @@ export class BlameLensManager implements vscode.CodeLensProvider {
     // Show the markdown content - VS Code's showInformationMessage will display
     // the text, though markdown formatting may not be fully rendered
     // For better UX, we could create a webview, but for now this works
-    vscode.window.showInformationMessage(mdString, { modal: false });
+    vscode.window.showInformationMessage(mdString, { modal: false,   });
   }
 
   public dispose(): void {
@@ -951,6 +1167,10 @@ export class BlameLensManager implements vscode.CodeLensProvider {
     this.blameService.dispose();
     this.statusBarItem.dispose();
     this._onDidChangeCodeLenses.dispose();
+    this._onDidChangeVirtualDocument.dispose();
+    
+    // Clear markdown content store
+    this.markdownContentStore.clear();
     
     // Dispose all color decorations
     this.colorDecorations.forEach(decoration => decoration.dispose());
