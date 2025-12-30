@@ -104,11 +104,7 @@ export class BlameLensManager {
     this.statusBarItem.command = 'git-ai.toggleAICode';
     this.statusBarItem.text = '🧑‍💻';
     this.statusBarItem.tooltip = 'Human-authored code (click to toggle AI highlighting)';
-    
-    // Only show status bar if blame is enabled
-    if (this.blameEnabled) {
-      this.statusBarItem.show();
-    }
+    // Status bar starts hidden - only shown after blame loads
   }
 
   public activate(): void {
@@ -420,15 +416,13 @@ export class BlameLensManager {
       
       console.log('[git-ai] Blame functionality disabled');
     } else {
-      // Enabled: show status bar, resume normal behavior
-      this.statusBarItem.show();
-      
+      // Enabled: resume normal behavior, let updateStatusBar control visibility
       // If toggle was on, re-request blame for current file
       if (this.toggleAICodeEnabled && editor) {
         this.requestBlameForFullFile(editor);
       }
       
-      // Update status bar
+      // Update status bar (will show it once blame loads)
       this.updateStatusBar(editor);
       
       console.log('[git-ai] Blame functionality enabled');
@@ -532,8 +526,7 @@ export class BlameLensManager {
    */
   private async updateStatusBar(editor: vscode.TextEditor | undefined): Promise<void> {
     if (!editor) {
-      this.statusBarItem.text = '🧑‍💻';
-      this.statusBarItem.tooltip = 'Human-authored code (click to toggle AI highlighting)';
+      this.statusBarItem.hide();
       return;
     }
 
