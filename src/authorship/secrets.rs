@@ -5,6 +5,7 @@
 //! in-place before saving to git notes.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 /// Minimum length for a string to be considered a potential secret
 const MIN_SECRET_LENGTH: usize = 15;
@@ -58,6 +59,45 @@ const BIGRAMS: &[&[u8]] = &[
     b"cu", b"br", b"TE", b"ST", b"R_", b"E8", b"/O",
 ];
 
+/// Pre-computed ln(n!) lookup table for n = 0..=MAX_SECRET_LENGTH
+/// This avoids O(n) factorial computation on every call to p_binomial
+static LOG_FACTORIALS: OnceLock<[f64; MAX_SECRET_LENGTH + 1]> = OnceLock::new();
+
+/// Get the pre-computed log-factorial lookup table
+fn get_log_factorials() -> &'static [f64; MAX_SECRET_LENGTH + 1] {
+    LOG_FACTORIALS.get_or_init(|| {
+        let mut table = [0.0; MAX_SECRET_LENGTH + 1];
+        // ln(0!) = ln(1) = 0, already set
+        for i in 1..=MAX_SECRET_LENGTH {
+            table[i] = table[i - 1] + (i as f64).ln();
+        }
+        table
+    })
+}
+
+/// Get ln(n!) from the lookup table
+#[inline]
+fn log_factorial(n: usize) -> f64 {
+    get_log_factorials()[n]
+}
+
+/// Pre-computed BIGRAMS HashSet for efficient lookup
+static BIGRAMS_SET: OnceLock<HashSet<&'static [u8]>> = OnceLock::new();
+
+/// Get the pre-computed BIGRAMS HashSet
+fn get_bigrams_set() -> &'static HashSet<&'static [u8]> {
+    BIGRAMS_SET.get_or_init(|| BIGRAMS.iter().copied().collect())
+}
+
+/// Global cache for Stirling numbers (num_distinct_configurations)
+/// Key: (num_values, num_distinct_values), Value: number of configurations
+use std::sync::Mutex;
+static STIRLING_CACHE: OnceLock<Mutex<HashMap<(usize, usize), f64>>> = OnceLock::new();
+
+fn get_stirling_cache() -> &'static Mutex<HashMap<(usize, usize), f64>> {
+    STIRLING_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Check if a string matches hexadecimal pattern (16+ chars of 0-9a-fA-F)
 fn is_hex_string(s: &[u8]) -> bool {
     if s.len() < 16 {
@@ -101,7 +141,7 @@ pub fn p_random(s: &[u8]) -> f64 {
 /// Calculate probability based on bigram frequency.
 /// Random strings should have roughly 10% of common source code bigrams.
 fn p_random_bigrams(s: &[u8]) -> f64 {
-    let bigrams_set: HashSet<&[u8]> = BIGRAMS.iter().copied().collect();
+    let bigrams_set = get_bigrams_set();
 
     let mut num_bigrams = 0;
     for i in 0..s.len().saturating_sub(1) {
@@ -157,28 +197,33 @@ fn p_random_char_class_aux(s: &[u8], min: u8, max: u8, base: f64) -> f64 {
 }
 
 /// Calculate binomial probability (cumulative tail probability).
+/// Uses log-space arithmetic for numerical stability and O(n) complexity.
 fn p_binomial(n: usize, x: usize, p: f64) -> f64 {
+    // Handle edge cases to avoid log(0)
+    if p <= 0.0 {
+        return if x == 0 { 1.0 } else { 0.0 };
+    }
+    if p >= 1.0 {
+        return if x == n { 1.0 } else { 0.0 };
+    }
+
     let left_tail = (x as f64) < n as f64 * p;
     let min = if left_tail { 0 } else { x };
     let max = if left_tail { x } else { n };
 
+    let log_p = p.ln();
+    let log_1_minus_p = (1.0 - p).ln();
+
     let mut total_p = 0.0;
     for i in min..=max {
-        total_p += factorial(n) / (factorial(n - i) * factorial(i))
-            * p.powi(i as i32)
-            * (1.0 - p).powi((n - i) as i32);
+        // log(C(n,i)) = log(n!) - log((n-i)!) - log(i!)
+        let log_binom_coeff = log_factorial(n) - log_factorial(n - i) - log_factorial(i);
+        // log(p^i * (1-p)^(n-i)) = i*log(p) + (n-i)*log(1-p)
+        let log_term = log_binom_coeff + (i as f64) * log_p + ((n - i) as f64) * log_1_minus_p;
+        total_p += log_term.exp();
     }
 
     total_p
-}
-
-/// Calculate factorial with f64 to handle large numbers.
-fn factorial(n: usize) -> f64 {
-    let mut res = 1.0;
-    for i in 2..=n {
-        res *= i as f64;
-    }
-    res
 }
 
 /// Calculate probability based on number of distinct character values.
@@ -212,20 +257,42 @@ fn num_possible_outcomes(num_values: usize, num_distinct_values: usize, base: us
     res
 }
 
-/// Calculate number of distinct configurations using memoization.
+/// Calculate number of distinct configurations (Stirling numbers of the second kind).
+/// Uses a global cache to avoid recomputing across calls.
 fn num_distinct_configurations(num_values: usize, num_distinct_values: usize) -> f64 {
     if num_distinct_values == 1 || num_distinct_values == num_values {
         return 1.0;
     }
+    if num_distinct_values == 0 || num_distinct_values > num_values {
+        return 0.0;
+    }
 
-    // Use a simple cache instead of the memoize crate
-    let mut cache: HashMap<(usize, usize, usize), f64> = HashMap::new();
-    num_distinct_configurations_aux(
+    let key = (num_values, num_distinct_values);
+
+    // Check global cache first
+    {
+        let cache = get_stirling_cache().lock().unwrap();
+        if let Some(&cached) = cache.get(&key) {
+            return cached;
+        }
+    }
+
+    // Compute using local cache for the recursive computation
+    let mut local_cache: HashMap<(usize, usize, usize), f64> = HashMap::new();
+    let result = num_distinct_configurations_aux(
         num_distinct_values,
         0,
         num_values - num_distinct_values,
-        &mut cache,
-    )
+        &mut local_cache,
+    );
+
+    // Store in global cache
+    {
+        let mut cache = get_stirling_cache().lock().unwrap();
+        cache.insert(key, result);
+    }
+
+    result
 }
 
 fn num_distinct_configurations_aux(
