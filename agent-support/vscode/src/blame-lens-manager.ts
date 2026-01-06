@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { BlameService, BlameResult, LineBlameInfo } from "./blame-service";
-import { Config } from "./utils/config";
+import { Config, BlameMode } from "./utils/config";
 
 export class BlameLensManager {
   private context: vscode.ExtensionContext;
@@ -10,11 +10,8 @@ export class BlameLensManager {
   private pendingBlameRequest: Promise<BlameResult | null> | null = null;
   private statusBarItem: vscode.StatusBarItem;
   
-  // In-memory toggle for showing all AI code (not persisted, per-workspace)
-  private toggleAICodeEnabled: boolean = false;
-  
-  // Global setting to enable/disable blame functionality entirely
-  private blameEnabled: boolean = true;
+  // Current blame mode (persisted via settings)
+  private blameMode: BlameMode = 'line';
   
   // Track notification timeout to prevent stacking
   private notificationTimeout: NodeJS.Timeout | null = null;
@@ -94,7 +91,7 @@ export class BlameLensManager {
     this.blameService = new BlameService();
     
     // Initialize from global setting
-    this.blameEnabled = Config.isBlameEnabled();
+    this.blameMode = Config.getBlameMode();
 
     // Initialize filtered colors and create decoration types based on theme contrast
     this.rebuildColorDecorations();
@@ -177,21 +174,21 @@ export class BlameLensManager {
       })
     );
 
-    // Register Toggle AI Code command
+    // Register Toggle AI Code command (now shows QuickPick for mode selection)
     this.context.subscriptions.push(
       vscode.commands.registerCommand('git-ai.toggleAICode', () => {
-        this.handleToggleAICode();
+        this.showBlameModeQuickPick();
       })
     );
 
     // Add status bar item to context subscriptions for proper cleanup
     this.context.subscriptions.push(this.statusBarItem);
 
-    // Listen for configuration changes to enable/disable blame
+    // Listen for configuration changes to blame mode
     this.context.subscriptions.push(
       vscode.workspace.onDidChangeConfiguration((event) => {
-        if (event.affectsConfiguration('gitai.enableBlame')) {
-          this.handleBlameEnabledChange();
+        if (event.affectsConfiguration('gitai.blameMode')) {
+          this.handleBlameModeChange();
         }
         // Rebuild color decorations if workbench color customizations change
         if (event.affectsConfiguration('workbench.colorCustomizations')) {
@@ -213,14 +210,9 @@ export class BlameLensManager {
   }
 
   /**
-   * Handle document save - invalidate cache and refresh blame if toggle is enabled.
+   * Handle document save - invalidate cache and refresh blame if enabled.
    */
   private handleDocumentSave(document: vscode.TextDocument): void {
-    // Skip if blame is disabled
-    if (!this.blameEnabled) {
-      return;
-    }
-    
     const documentUri = document.uri.toString();
     
     // Invalidate cached blame for this document
@@ -236,8 +228,8 @@ export class BlameLensManager {
         // Clear existing colored borders
         this.clearColoredBorders(activeEditor);
         
-        // Re-fetch blame if toggle is enabled
-        if (this.toggleAICodeEnabled) {
+        // Re-fetch blame if mode is 'all'
+        if (this.blameMode === 'all') {
           this.requestBlameForFullFile(activeEditor);
         }
         
@@ -255,11 +247,6 @@ export class BlameLensManager {
    */
   private documentChangeTimer: NodeJS.Timeout | null = null;
   private handleDocumentChange(event: vscode.TextDocumentChangeEvent): void {
-    // Skip if blame is disabled
-    if (!this.blameEnabled) {
-      return;
-    }
-    
     const documentUri = event.document.uri.toString();
     
     // Only handle changes to the current document we have blame for
@@ -289,8 +276,8 @@ export class BlameLensManager {
         // Clear existing colored borders
         this.clearColoredBorders(activeEditor);
         
-        // Re-fetch blame if toggle is enabled
-        if (this.toggleAICodeEnabled) {
+        // Re-fetch blame if mode is 'all'
+        if (this.blameMode === 'all') {
           this.requestBlameForFullFile(activeEditor);
         }
         
@@ -334,11 +321,6 @@ export class BlameLensManager {
    * Handle active editor change - update status bar and decorations.
    */
   private handleActiveEditorChange(editor: vscode.TextEditor | undefined): void {
-    // Skip if blame is disabled
-    if (!this.blameEnabled) {
-      return;
-    }
-    
     // Clear colored borders from previous editor
     const previousEditor = vscode.window.visibleTextEditors.find(
       e => e.document.uri.toString() === this.currentDocumentUri
@@ -354,8 +336,8 @@ export class BlameLensManager {
       this.pendingBlameRequest = null;
     }
     
-    // If Toggle AI Code is enabled, automatically request blame for the new editor
-    if (this.toggleAICodeEnabled && editor) {
+    // If mode is 'all', automatically request blame for the new editor
+    if (this.blameMode === 'all' && editor) {
       this.requestBlameForFullFile(editor);
     }
     
@@ -364,98 +346,116 @@ export class BlameLensManager {
   }
 
   /**
-   * Handle Toggle AI Code command - toggles the in-memory state for showing all AI code.
+   * Show QuickPick dropdown for selecting blame mode.
    */
-  private handleToggleAICode(): void {
-    // If blame is disabled globally, don't allow toggling
-    if (!this.blameEnabled) {
-      vscode.window.showInformationMessage('git-ai: Blame is disabled. Enable it in settings (gitai.enableBlame).');
-      return;
+  private async showBlameModeQuickPick(): Promise<void> {
+    const items: vscode.QuickPickItem[] = [
+      {
+        label: 'Off',
+        description: 'No Gutter Annotations for AI Lines',
+        picked: this.blameMode === 'off',
+      },
+      {
+        label: 'Line',
+        description: 'Show Gutter Annotations for current line\'s prompt',
+        picked: this.blameMode === 'line',
+      },
+      {
+        label: 'All',
+        description: 'Show Gutter Annotations for all AI-authored lines',
+        picked: this.blameMode === 'all',
+      },
+    ];
+    
+    const selected = await vscode.window.showQuickPick(items, {
+      placeHolder: 'Select Git AI Blame Mode',
+      title: 'Git AI Blame Mode',
+    });
+    
+    if (!selected) {
+      return; // User cancelled
     }
     
-    this.toggleAICodeEnabled = !this.toggleAICodeEnabled;
-    
-    const editor = vscode.window.activeTextEditor;
-    
-    if (this.toggleAICodeEnabled) {
-      // Toggled ON: request blame and show all AI code
-      if (editor) {
-        this.requestBlameForFullFile(editor);
-      }
+    // Determine selected mode from label
+    let newMode: BlameMode;
+    if (selected.label === 'Off') {
+      newMode = 'off';
+    } else if (selected.label === 'Line') {
+      newMode = 'line';
     } else {
-      // Toggled OFF: clear decorations
-      if (editor) {
-        this.clearColoredBorders(editor);
-      }
-      this.currentBlameResult = null;
-      this.currentDocumentUri = null;
+      newMode = 'all';
     }
     
-    // Update status bar to reflect new state
-    this.updateStatusBar(editor);
-    
-    // Show notification (debounced to prevent stacking)
-    if (this.notificationTimeout) {
-      clearTimeout(this.notificationTimeout);
+    // Only update if mode changed
+    if (newMode !== this.blameMode) {
+      await this.applyBlameMode(newMode);
     }
-    this.notificationTimeout = setTimeout(() => {
-      const message = this.toggleAICodeEnabled 
-        ? 'Git AI Code Lens Enabled' 
-        : 'Git AI Code Lens Disabled';
-      vscode.window.showInformationMessage(message);
-      this.notificationTimeout = null;
-    }, 100);
   }
 
   /**
-   * Handle global blame enabled setting change.
-   * When disabled: hide status bar, clear decorations, cancel pending blames.
-   * When enabled: show status bar, resume normal behavior.
+   * Apply a new blame mode and persist to settings.
    */
-  private handleBlameEnabledChange(): void {
-    const newValue = Config.isBlameEnabled();
+  private async applyBlameMode(newMode: BlameMode): Promise<void> {
+    const oldMode = this.blameMode;
+    this.blameMode = newMode;
     
-    // No change, nothing to do
-    if (newValue === this.blameEnabled) {
-      return;
-    }
+    // Persist to settings
+    await Config.setBlameMode(newMode);
     
-    this.blameEnabled = newValue;
     const editor = vscode.window.activeTextEditor;
     
-    if (!this.blameEnabled) {
-      // Disabled: hide status bar, clear decorations, cancel pending blames
-      this.statusBarItem.hide();
-      
+    // Handle mode transitions
+    if (newMode === 'all') {
+      // Switching to all: request full file blame
+      if (editor) {
+        this.requestBlameForFullFile(editor);
+      }
+    } else if (oldMode === 'all') {
+      // Switching from all to line/off: clear full-file decorations
       if (editor) {
         this.clearColoredBorders(editor);
       }
-      
-      // Cancel any pending blame requests
-      if (this.currentDocumentUri) {
-        const uri = vscode.Uri.parse(this.currentDocumentUri);
-        this.blameService.cancelForUri(uri);
-        this.blameService.invalidateCache(uri);
-      }
-      
-      // Reset state
-      this.currentBlameResult = null;
-      this.currentDocumentUri = null;
-      this.pendingBlameRequest = null;
-      
-      console.log('[git-ai] Blame functionality disabled');
-    } else {
-      // Enabled: resume normal behavior, let updateStatusBar control visibility
-      // If toggle was on, re-request blame for current file
-      if (this.toggleAICodeEnabled && editor) {
+    }
+    
+    // Update status bar
+    this.updateStatusBar(editor);
+    
+    console.log(`[git-ai] Blame mode changed to: ${newMode}`);
+  }
+
+  /**
+   * Handle blame mode setting change from VS Code settings.
+   * This is called when the user changes the setting via Settings UI or settings.json.
+   */
+  private handleBlameModeChange(): void {
+    const newMode = Config.getBlameMode();
+    
+    // No change, nothing to do
+    if (newMode === this.blameMode) {
+      return;
+    }
+    
+    const oldMode = this.blameMode;
+    this.blameMode = newMode;
+    const editor = vscode.window.activeTextEditor;
+    
+    // Handle mode transitions
+    if (newMode === 'all') {
+      // Switching to all: request full file blame
+      if (editor) {
         this.requestBlameForFullFile(editor);
       }
-      
-      // Update status bar (will show it once blame loads)
-      this.updateStatusBar(editor);
-      
-      console.log('[git-ai] Blame functionality enabled');
+    } else if (oldMode === 'all') {
+      // Switching from all to line/off: clear full-file decorations
+      if (editor) {
+        this.clearColoredBorders(editor);
+      }
     }
+    
+    // Update status bar
+    this.updateStatusBar(editor);
+    
+    console.log(`[git-ai] Blame mode changed to: ${newMode} via settings`);
   }
 
   /**
@@ -492,9 +492,9 @@ export class BlameLensManager {
       if (result) {
         this.currentBlameResult = result;
         
-        // Check if editor is still active and toggle is still enabled
+        // Check if editor is still active and mode is still 'all'
         const currentEditor = vscode.window.activeTextEditor;
-        if (this.toggleAICodeEnabled && currentEditor && currentEditor.document.uri.toString() === documentUri) {
+        if (this.blameMode === 'all' && currentEditor && currentEditor.document.uri.toString() === documentUri) {
           this.applyFullFileDecorations(currentEditor, result);
           this.updateStatusBar(currentEditor);
         }
@@ -539,11 +539,6 @@ export class BlameLensManager {
    * Handle cursor/selection change - update status bar to show current line's attribution.
    */
   private handleSelectionChange(event: vscode.TextEditorSelectionChangeEvent): void {
-    // Skip if blame is disabled
-    if (!this.blameEnabled) {
-      return;
-    }
-    
     const editor = event.textEditor;
     this.updateStatusBar(editor);
   }
@@ -618,26 +613,28 @@ export class BlameLensManager {
         this.statusBarItem.text = '🤖';
       }
       
-      // Build tooltip with full markdown content
-      this.statusBarItem.tooltip = this.buildHoverContent(lineInfo, document.uri);
+      // Simple tooltip - no prompt content
+      this.statusBarItem.tooltip = 'AI-authored code (click to change mode)';
       
-      // Show gutter decorations for this prompt (unless toggle is on, which shows all)
-      if (!this.toggleAICodeEnabled) {
+      // Show gutter decorations based on mode
+      if (this.blameMode === 'line') {
         this.applyDecorationsForPrompt(editor, lineInfo.commitHash, this.currentBlameResult);
       }
+      // Mode 'all' already shows all decorations, mode 'off' shows none
       
       // Show after-text decoration with hover for AI lines
       this.updateAfterTextDecoration(editor, lineInfo, document.uri);
     } else {
       // Show human icon for human-authored code
       this.statusBarItem.text = '🧑‍💻';
-      this.statusBarItem.tooltip = 'Human-authored code (click to toggle AI highlighting)';
+      this.statusBarItem.tooltip = 'Human-authored code (click to change mode)';
       this.statusBarItem.color = undefined; // Reset color for human code
       
-      // Clear decorations if not on AI line (unless toggle is on)
-      if (!this.toggleAICodeEnabled) {
+      // Clear decorations if not on AI line (in 'line' mode)
+      if (this.blameMode === 'line') {
         this.clearColoredBorders(editor);
       }
+      // Mode 'all' keeps all decorations, mode 'off' already has none
       
       // Clear after-text decoration for human lines
       this.clearAfterTextDecoration();
@@ -861,10 +858,8 @@ export class BlameLensManager {
     // Get current theme background colors
     const backgrounds = this.getThemeBackgroundColors();
     
-    // Filter colors by contrast
     this.filteredColors = this.filterColorsByContrast(this.HUNK_COLORS, backgrounds);
     
-    // Ensure we always have at least some colors (fallback to full list if filtering removes all)
     if (this.filteredColors.length === 0) {
       console.log('[git-ai] All colors filtered out by contrast check, using full palette');
       this.filteredColors = [...this.HUNK_COLORS];
@@ -883,8 +878,8 @@ export class BlameLensManager {
       })
     );
     
-    // Re-apply decorations if toggle is enabled
-    if (this.toggleAICodeEnabled) {
+    // Re-apply decorations if mode is 'all'
+    if (this.blameMode === 'all') {
       const editor = vscode.window.activeTextEditor;
       if (editor && this.currentBlameResult) {
         this.applyFullFileDecorations(editor, this.currentBlameResult);
@@ -945,6 +940,7 @@ export class BlameLensManager {
       after: {
         contentText: ` + ${displayName}`,
         color: gutterColorHex,
+        margin: '0 2px 0 0',
         
       },
       overviewRulerLane: vscode.OverviewRulerLane.Left,
