@@ -101,8 +101,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.target }}-
 
-      - name: Build release binary (non-Docker)
-        if: matrix.use_docker == false
+      - name: Build release binary (non-Docker, non-Windows-ARM64)
+        if: matrix.use_docker == false && matrix.os != 'windows-11-arm'
         run: |
           cargo build --release --target ${{ matrix.target }}
         env:
@@ -110,6 +110,17 @@ jobs:
           SENTRY_OSS: ${{ secrets.SENTRY_OSS }}
           POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
           OSS_BUILD: "1"
+
+      - name: Build release binary (Windows ARM64 with LLVM strip)
+        if: matrix.os == 'windows-11-arm'
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_INCREMENTAL: 0
+          SENTRY_OSS: ${{ secrets.SENTRY_OSS }}
+          POSTHOG_API_KEY: ${{ secrets.POSTHOG_API_KEY }}
+          OSS_BUILD: "1"
+          RUSTFLAGS: "-C strip=symbols"
 
       - name: Verify binary architecture (Linux)
         if: contains(matrix.os, 'ubuntu')
