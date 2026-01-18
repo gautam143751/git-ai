@@ -584,6 +584,25 @@ impl NewCommit {
 }
 
 static COMPILED_BINARY: OnceLock<PathBuf> = OnceLock::new();
+static DEFAULT_BRANCH_NAME: OnceLock<String> = OnceLock::new();
+
+fn get_default_branch_name() -> String {
+    let output = Command::new("git")
+        .args(["config", "--global", "init.defaultBranch"])
+        .output()
+        .expect("Failed to execute git config command");
+
+    if output.status.success() {
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    } else {
+        // Fallback to "master" if not configured
+        "master".to_string()
+    }
+}
+
+pub fn default_branchname() -> &'static str {
+    DEFAULT_BRANCH_NAME.get_or_init(get_default_branch_name)
+}
 
 fn compile_binary() -> PathBuf {
     println!("Compiling git-ai binary for tests...");

@@ -1,7 +1,7 @@
 mod repos;
 
 use repos::test_file::ExpectedLineExt;
-use repos::test_repo::TestRepo;
+use repos::test_repo::{default_branchname, TestRepo};
 
 /// Test that checkout to a different branch migrates the working log to the new HEAD.
 #[test]
@@ -167,7 +167,7 @@ fn test_switch_discard_changes_deletes_working_log() {
         .expect("feature commit should succeed");
 
     // Switch back to main
-    repo.git(&["switch", "main"])
+    repo.git(&["switch", default_branchname()])
         .expect("switch to main should succeed");
 
     // Create AI changes on main (uncommitted)
@@ -208,7 +208,7 @@ fn test_switch_force_flag_deletes_working_log() {
         .expect("feature commit should succeed");
 
     // Switch back to main
-    repo.git(&["switch", "main"])
+    repo.git(&["switch", default_branchname()])
         .expect("switch to main should succeed");
 
     // Create AI changes on main (uncommitted)
@@ -334,7 +334,7 @@ fn test_checkout_same_branch_no_op() {
         .expect("checkpoint should succeed");
 
     // Checkout same branch (should be no-op)
-    repo.git(&["checkout", "main"])
+    repo.git(&["checkout", default_branchname()])
         .expect("checkout same branch should succeed");
 
     // Commit and verify AI attribution is preserved
