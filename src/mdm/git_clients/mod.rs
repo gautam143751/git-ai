@@ -1,5 +1,7 @@
 mod fork_app;
 mod github_desktop;
+#[cfg(target_os = "macos")]
+pub mod mac_prefs;
 mod sublime_merge;
 
 pub use fork_app::ForkAppInstaller;
