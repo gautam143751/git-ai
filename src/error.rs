@@ -106,7 +106,7 @@ impl Clone for GitAiError {
             GitAiError::PresetError(s) => GitAiError::PresetError(s.clone()),
             GitAiError::SqliteError(e) => GitAiError::Generic(format!("SQLite error: {}", e)),
             GitAiError::Generic(s) => GitAiError::Generic(s.clone()),
-            GitAiError::GixError(s) => GitAiError::GixError(s.clone()),
+            GitAiError::GixError(e) => GitAiError::Generic(format!("Gix error: {}", e)),
         }
     }
 }
