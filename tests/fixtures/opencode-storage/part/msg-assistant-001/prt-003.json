@@ -4,7 +4,7 @@
   "messageID": "msg-assistant-001",
   "text": "Done! I've updated the comment to 'Hello World'.",
   "time": {
-    "created": 1706459834000,
-    "completed": 1706459834500
+    "start": 1706459834000,
+    "end": 1706459834500
   }
 }

@@ -4,7 +4,7 @@
   "messageID": "msg-user-001",
   "text": "Update the comment in index.ts to say 'Hello World'",
   "time": {
-    "created": 1706459830000,
-    "completed": 1706459830050
+    "start": 1706459830000,
+    "end": 1706459830050
   }
 }

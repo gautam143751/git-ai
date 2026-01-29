@@ -51,6 +51,21 @@ struct OpenCodeTime {
     completed: Option<i64>,
 }
 
+/// Tool state object containing status and nested data
+#[derive(Debug, Deserialize)]
+struct ToolState {
+    #[allow(dead_code)]
+    status: Option<String>,
+    input: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    output: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    title: Option<String>,
+    #[allow(dead_code)]
+    metadata: Option<serde_json::Value>,
+    time: Option<OpenCodePartTime>,
+}
+
 /// Part content from part/{msg_id}/{prt_id}.json
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -60,7 +75,9 @@ enum OpenCodePart {
         #[allow(dead_code)]
         message_id: String,
         text: String,
-        time: OpenCodePartTime,
+        time: Option<OpenCodePartTime>,
+        #[allow(dead_code)]
+        synthetic: Option<bool>,
         #[allow(dead_code)]
         id: Option<String>,
     },
@@ -72,12 +89,11 @@ enum OpenCodePart {
         #[serde(rename = "callID")]
         #[allow(dead_code)]
         call_id: String,
-        #[allow(dead_code)]
-        state: Option<String>, // "partial" | "pending" | "running" | "result"
+        state: Option<ToolState>,
         input: Option<serde_json::Value>,
         #[allow(dead_code)]
         output: Option<serde_json::Value>,
-        time: OpenCodePartTime,
+        time: Option<OpenCodePartTime>,
         #[allow(dead_code)]
         id: Option<String>,
     },
@@ -86,7 +102,7 @@ enum OpenCodePart {
         #[allow(dead_code)]
         message_id: String,
         #[allow(dead_code)]
-        time: OpenCodePartTime,
+        time: Option<OpenCodePartTime>,
         #[allow(dead_code)]
         id: Option<String>,
     },
@@ -95,7 +111,7 @@ enum OpenCodePart {
         #[allow(dead_code)]
         message_id: String,
         #[allow(dead_code)]
-        time: OpenCodePartTime,
+        time: Option<OpenCodePartTime>,
         #[allow(dead_code)]
         id: Option<String>,
     },
@@ -105,9 +121,9 @@ enum OpenCodePart {
 
 #[derive(Debug, Deserialize)]
 struct OpenCodePartTime {
-    created: i64,
+    start: i64,
     #[allow(dead_code)]
-    completed: Option<i64>,
+    end: Option<i64>,
 }
 
 impl AgentCheckpointPreset for OpenCodePreset {
@@ -310,15 +326,18 @@ impl OpenCodePreset {
                     OpenCodePart::Tool {
                         tool,
                         input,
+                        state,
                         ..
                     } => {
                         // Only include tool calls from assistant messages
                         if message.role == "assistant" {
+                            // Try part input first, then state.input as fallback
+                            let tool_input = input
+                                .or_else(|| state.and_then(|s| s.input))
+                                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                             transcript.add_message(Message::ToolUse {
                                 name: tool,
-                                input: input.unwrap_or(serde_json::Value::Object(
-                                    serde_json::Map::new(),
-                                )),
+                                input: tool_input,
                                 timestamp: timestamp.clone(),
                             });
                         }
@@ -407,12 +426,29 @@ impl OpenCodePreset {
                     Ok(content) => {
                         match serde_json::from_str::<OpenCodePart>(&content) {
                             Ok(part) => {
-                                // Extract creation time for sorting
+                                // Extract creation time for sorting (handles optional time fields)
                                 let created = match &part {
-                                    OpenCodePart::Text { time, .. } => time.created,
-                                    OpenCodePart::Tool { time, .. } => time.created,
-                                    OpenCodePart::StepStart { time, .. } => time.created,
-                                    OpenCodePart::StepFinish { time, .. } => time.created,
+                                    OpenCodePart::Text { time, .. } => {
+                                        time.as_ref().map(|t| t.start).unwrap_or(0)
+                                    }
+                                    OpenCodePart::Tool { time, state, .. } => {
+                                        // Try part time first, then state time as fallback
+                                        time.as_ref()
+                                            .map(|t| t.start)
+                                            .or_else(|| {
+                                                state
+                                                    .as_ref()
+                                                    .and_then(|s| s.time.as_ref())
+                                                    .map(|t| t.start)
+                                            })
+                                            .unwrap_or(0)
+                                    }
+                                    OpenCodePart::StepStart { time, .. } => {
+                                        time.as_ref().map(|t| t.start).unwrap_or(0)
+                                    }
+                                    OpenCodePart::StepFinish { time, .. } => {
+                                        time.as_ref().map(|t| t.start).unwrap_or(0)
+                                    }
                                     OpenCodePart::Unknown => 0,
                                 };
                                 parts.push((created, part));
