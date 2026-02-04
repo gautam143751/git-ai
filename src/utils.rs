@@ -472,4 +472,48 @@ mod tests {
             "ગુજરાતી.txt"
         );
     }
+
+    // =========================================================================
+    // Phase 4: Southeast Asian Scripts Tests (Thai, Vietnamese, Khmer, Lao)
+    // =========================================================================
+
+    #[test]
+    fn test_unescape_thai() {
+        // Thai "ไทย" (Thai)
+        // ไ = \340\271\204, ท = \340\270\227, ย = \340\270\242
+        assert_eq!(
+            unescape_git_path("\"\\340\\271\\204\\340\\270\\227\\340\\270\\242.txt\""),
+            "ไทย.txt"
+        );
+    }
+
+    #[test]
+    fn test_unescape_vietnamese() {
+        // Vietnamese "tiếng" with tone marks
+        // t = 't', i = 'i', ế = \341\272\277, n = 'n', g = 'g'
+        assert_eq!(
+            unescape_git_path("\"ti\\341\\272\\277ng.txt\""),
+            "tiếng.txt"
+        );
+    }
+
+    #[test]
+    fn test_unescape_khmer() {
+        // Khmer "ខ្មែរ" (Khmer)
+        // ខ = \341\236\201, ្ = \341\237\222, ម = \341\236\230, ែ = \341\237\202, រ = \341\236\232
+        assert_eq!(
+            unescape_git_path("\"\\341\\236\\201\\341\\237\\222\\341\\236\\230\\341\\237\\202\\341\\236\\232.txt\""),
+            "ខ្មែរ.txt"
+        );
+    }
+
+    #[test]
+    fn test_unescape_lao() {
+        // Lao "ລາວ" (Lao)
+        // ລ = \340\272\245, າ = \340\272\262, ວ = \340\272\247
+        assert_eq!(
+            unescape_git_path("\"\\340\\272\\245\\340\\272\\262\\340\\272\\247.txt\""),
+            "ລາວ.txt"
+        );
+    }
 }
