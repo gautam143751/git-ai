@@ -22,6 +22,20 @@ pub enum MetricEventId {
     Checkpoint = 4,
 }
 
+impl TryFrom<u16> for MetricEventId {
+    type Error = ();
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(MetricEventId::Committed),
+            2 => Ok(MetricEventId::AgentUsage),
+            3 => Ok(MetricEventId::InstallHooks),
+            4 => Ok(MetricEventId::Checkpoint),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Trait for event-specific values.
 pub trait EventValues: Sized {
     fn event_id() -> MetricEventId;

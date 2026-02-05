@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::metrics::{MetricEvent, METRICS_API_VERSION};
 
 pub mod flush;
+pub mod otel;
 pub mod wrapper_performance_targets;
 
 /// Maximum events per metrics envelope
@@ -202,9 +203,17 @@ pub fn spawn_background_flush() {
 /// Events are batched into envelopes of up to 250 events each.
 /// The flush-logs command will then upload them to the API or
 /// store them in SQLite for later upload.
+///
+/// If OpenTelemetry export is enabled (via `otel` feature and configuration),
+/// events are also exported to the configured OTLP endpoint.
 pub fn log_metrics(events: Vec<MetricEvent>) {
     if events.is_empty() {
         return;
+    }
+
+    // Export to OpenTelemetry if enabled (non-blocking, won't impact existing pipeline)
+    for event in &events {
+        otel::export_metric_event(event);
     }
 
     // Split into chunks of MAX_METRICS_PER_ENVELOPE

@@ -32,6 +32,9 @@ pub struct Config {
     prompt_storage: String,
     api_key: Option<String>,
     quiet: bool,
+    otel_enabled: bool,
+    otel_endpoint: Option<String>,
+    otel_export_interval_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +101,12 @@ pub struct FileConfig {
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quiet: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otel_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otel_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otel_export_interval_secs: Option<u64>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -271,6 +280,21 @@ impl Config {
         self.quiet
     }
 
+    /// Returns true if OpenTelemetry export is enabled
+    pub fn is_otel_enabled(&self) -> bool {
+        self.otel_enabled
+    }
+
+    /// Returns the OpenTelemetry OTLP endpoint if configured
+    pub fn otel_endpoint(&self) -> Option<&str> {
+        self.otel_endpoint.as_deref()
+    }
+
+    /// Returns the OpenTelemetry export interval in seconds
+    pub fn otel_export_interval_secs(&self) -> u64 {
+        self.otel_export_interval_secs
+    }
+
     /// Override feature flags for testing purposes.
     /// Only available when the `test-support` feature is enabled or in test mode.
     /// Must be `pub` to work with integration tests in the `tests/` directory.
@@ -437,6 +461,29 @@ fn build_config() -> Config {
         .and_then(|c| c.quiet)
         .unwrap_or(false);
 
+    // Get OTel settings from config file or env vars (env vars take precedence)
+    let otel_enabled = env::var("GIT_AI_OTEL_ENABLED")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .ok()
+        .or_else(|| file_cfg.as_ref().and_then(|c| c.otel_enabled))
+        .unwrap_or(false);
+
+    let otel_endpoint = env::var("GIT_AI_OTEL_ENDPOINT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            file_cfg
+                .as_ref()
+                .and_then(|c| c.otel_endpoint.clone())
+                .filter(|s| !s.is_empty())
+        });
+
+    let otel_export_interval_secs = env::var("GIT_AI_OTEL_EXPORT_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| file_cfg.as_ref().and_then(|c| c.otel_export_interval_secs))
+        .unwrap_or(60);
+
     #[cfg(any(test, feature = "test-support"))]
     {
         let mut config = Config {
@@ -454,6 +501,9 @@ fn build_config() -> Config {
             prompt_storage,
             api_key,
             quiet,
+            otel_enabled,
+            otel_endpoint,
+            otel_export_interval_secs,
         };
         apply_test_config_patch(&mut config);
         config
@@ -475,6 +525,9 @@ fn build_config() -> Config {
         prompt_storage,
         api_key,
         quiet,
+        otel_enabled,
+        otel_endpoint,
+        otel_export_interval_secs,
     }
 }
 
