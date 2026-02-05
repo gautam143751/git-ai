@@ -51,6 +51,7 @@ On commit, Git AI saves the final AI-attributions into a Git Note. These notes p
 The format of the notes is outlined here in the [Git AI Standard v3.0.0](https://github.com/git-ai-project/git-ai/blob/main/specs/git_ai_standard_v3.0.0.md)
 
 ## Goals of `git-ai` project
+<!-- Devin test comment - this PR is a dummy test to verify repo access -->
 
 🤖 **Track AI code in a Multi-Agent** world. Because developers get to choose their tools, engineering teams need a **vendor agnostic** way to track AI impact in their repos.
 
