@@ -35,6 +35,8 @@ pub struct Config {
     otel_enabled: bool,
     otel_endpoint: Option<String>,
     otel_export_interval_secs: u64,
+    otel_auth_header: Option<String>,
+    otel_protocol: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +109,10 @@ pub struct FileConfig {
     pub otel_endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otel_export_interval_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otel_auth_header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otel_protocol: Option<String>,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -293,6 +299,16 @@ impl Config {
     /// Returns the OpenTelemetry export interval in seconds
     pub fn otel_export_interval_secs(&self) -> u64 {
         self.otel_export_interval_secs
+    }
+
+    /// Returns the OpenTelemetry authorization header if configured
+    pub fn otel_auth_header(&self) -> Option<&str> {
+        self.otel_auth_header.as_deref()
+    }
+
+    /// Returns the OpenTelemetry protocol ("grpc" or "http")
+    pub fn otel_protocol(&self) -> &str {
+        &self.otel_protocol
     }
 
     /// Override feature flags for testing purposes.
@@ -484,6 +500,37 @@ fn build_config() -> Config {
         .or_else(|| file_cfg.as_ref().and_then(|c| c.otel_export_interval_secs))
         .unwrap_or(60);
 
+    let otel_auth_header = env::var("GIT_AI_OTEL_AUTH_HEADER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            file_cfg
+                .as_ref()
+                .and_then(|c| c.otel_auth_header.clone())
+                .filter(|s| !s.is_empty())
+        });
+
+    let otel_protocol = env::var("GIT_AI_OTEL_PROTOCOL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            file_cfg
+                .as_ref()
+                .and_then(|c| c.otel_protocol.clone())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "grpc".to_string());
+    let otel_protocol = match otel_protocol.to_lowercase().as_str() {
+        "http" | "grpc" => otel_protocol.to_lowercase(),
+        other => {
+            eprintln!(
+                "Warning: Invalid otel_protocol value '{}', using 'grpc'",
+                other
+            );
+            "grpc".to_string()
+        }
+    };
+
     #[cfg(any(test, feature = "test-support"))]
     {
         let mut config = Config {
@@ -504,6 +551,8 @@ fn build_config() -> Config {
             otel_enabled,
             otel_endpoint,
             otel_export_interval_secs,
+            otel_auth_header,
+            otel_protocol,
         };
         apply_test_config_patch(&mut config);
         config
@@ -528,6 +577,8 @@ fn build_config() -> Config {
         otel_enabled,
         otel_endpoint,
         otel_export_interval_secs,
+        otel_auth_header,
+        otel_protocol,
     }
 }
 
@@ -796,6 +847,11 @@ mod tests {
             prompt_storage: "default".to_string(),
             api_key: None,
             quiet: false,
+            otel_enabled: false,
+            otel_endpoint: None,
+            otel_export_interval_secs: 60,
+            otel_auth_header: None,
+            otel_protocol: "grpc".to_string(),
         }
     }
 
@@ -901,6 +957,11 @@ mod tests {
             prompt_storage: "default".to_string(),
             api_key: None,
             quiet: false,
+            otel_enabled: false,
+            otel_endpoint: None,
+            otel_export_interval_secs: 60,
+            otel_auth_header: None,
+            otel_protocol: "grpc".to_string(),
         }
     }
 
