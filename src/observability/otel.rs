@@ -12,6 +12,8 @@ use opentelemetry::KeyValue;
 #[cfg(feature = "otel")]
 use opentelemetry_otlp::WithExportConfig;
 #[cfg(feature = "otel")]
+use std::collections::HashMap;
+#[cfg(feature = "otel")]
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 #[cfg(feature = "otel")]
 use opentelemetry_sdk::Resource;
@@ -34,15 +36,33 @@ pub const DEFAULT_EXPORT_INTERVAL_SECS: u64 = 60;
 /// Service name for OpenTelemetry resource
 pub const SERVICE_NAME: &str = "git-ai";
 
+/// OTLP transport protocol
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OtelProtocol {
+    Grpc,
+    Http,
+}
+
+impl Default for OtelProtocol {
+    fn default() -> Self {
+        Self::Grpc
+    }
+}
+
 /// OpenTelemetry configuration
 #[derive(Debug, Clone)]
 pub struct OtelConfig {
-    /// OTLP endpoint URL (e.g., "http://localhost:4317")
+    /// OTLP endpoint URL (e.g., "http://localhost:4317" for gRPC,
+    /// "https://otlp-gateway-prod-us-east-0.grafana.net/otlp" for Grafana Cloud)
     pub endpoint: String,
     /// Whether OTel export is enabled
     pub enabled: bool,
     /// Export interval in seconds
     pub export_interval_secs: u64,
+    /// Authorization header value (e.g., "Basic <base64>" for Grafana Cloud)
+    pub auth_header: Option<String>,
+    /// OTLP transport protocol (gRPC or HTTP/protobuf)
+    pub protocol: OtelProtocol,
 }
 
 impl Default for OtelConfig {
@@ -51,6 +71,8 @@ impl Default for OtelConfig {
             endpoint: DEFAULT_OTEL_ENDPOINT.to_string(),
             enabled: false,
             export_interval_secs: DEFAULT_EXPORT_INTERVAL_SECS,
+            auth_header: None,
+            protocol: OtelProtocol::default(),
         }
     }
 }
@@ -70,10 +92,24 @@ impl OtelConfig {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_EXPORT_INTERVAL_SECS);
 
+        let auth_header = std::env::var("GIT_AI_OTEL_AUTH_HEADER")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        let protocol = std::env::var("GIT_AI_OTEL_PROTOCOL")
+            .ok()
+            .map(|v| match v.to_lowercase().as_str() {
+                "http" => OtelProtocol::Http,
+                _ => OtelProtocol::Grpc,
+            })
+            .unwrap_or_default();
+
         Self {
             endpoint,
             enabled,
             export_interval_secs,
+            auth_header,
+            protocol,
         }
     }
 }
@@ -183,12 +219,37 @@ pub fn init_otel(config: &OtelConfig) -> bool {
 fn init_otel_internal(config: &OtelConfig) -> Result<OtelState, Box<dyn std::error::Error>> {
     use opentelemetry_otlp::MetricExporter;
 
-    // Create OTLP exporter
-    let exporter = MetricExporter::builder()
-        .with_tonic()
-        .with_endpoint(&config.endpoint)
-        .with_timeout(Duration::from_secs(10))
-        .build()?;
+    let exporter = match config.protocol {
+        OtelProtocol::Http => {
+            let mut builder = MetricExporter::builder()
+                .with_http()
+                .with_endpoint(&config.endpoint)
+                .with_timeout(Duration::from_secs(10));
+            if let Some(auth) = &config.auth_header {
+                let mut headers = HashMap::new();
+                headers.insert("Authorization".to_string(), auth.clone());
+                builder = builder.with_headers(headers);
+            }
+            builder.build()?
+        }
+        OtelProtocol::Grpc => {
+            let mut builder = MetricExporter::builder()
+                .with_tonic()
+                .with_endpoint(&config.endpoint)
+                .with_timeout(Duration::from_secs(10));
+            if let Some(auth) = &config.auth_header {
+                let metadata = {
+                    let mut map = tonic::metadata::MetadataMap::new();
+                    if let Ok(val) = auth.parse() {
+                        map.insert("authorization", val);
+                    }
+                    map
+                };
+                builder = builder.with_metadata(metadata);
+            }
+            builder.build()?
+        }
+    };
 
     // Create periodic reader
     let reader = PeriodicReader::builder(exporter)
@@ -425,10 +486,11 @@ mod tests {
 
     #[test]
     fn test_otel_config_from_env() {
-        // Test with no env vars set
         let config = OtelConfig::from_env();
         assert!(!config.enabled);
         assert_eq!(config.endpoint, DEFAULT_OTEL_ENDPOINT);
+        assert!(config.auth_header.is_none());
+        assert_eq!(config.protocol, OtelProtocol::Grpc);
     }
 }
 
@@ -441,5 +503,7 @@ mod tests_no_feature {
         let config = OtelConfig::default();
         assert_eq!(config.endpoint, DEFAULT_OTEL_ENDPOINT);
         assert!(!config.enabled);
+        assert!(config.auth_header.is_none());
+        assert_eq!(config.protocol, OtelProtocol::Grpc);
     }
 }
